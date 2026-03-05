@@ -803,6 +803,61 @@ async def scanner():
 
         await asyncio.sleep(5)
 
+
+# ─── DIAGNOSTICS HELPER ───────────────────────────────────────────
+def _get_blockers():
+    """Returns list of reasons why no trade is firing right now"""
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    blockers = []
+    bars3  = len(CANDLES["3m"])
+    bars5  = len(CANDLES["5m"])
+    bars15 = len(CANDLES["15m"])
+
+    if not S["connected"]:
+        blockers.append("NOT CONNECTED — enter Dhan token in Settings")
+    if bars15 < 57:
+        blockers.append(f"15min candles: only {bars15}/57 ready — need more time")
+    if bars5 < 20:
+        blockers.append(f"5min candles: only {bars5}/20 ready")
+    if bars3 < 40:
+        blockers.append(f"3min candles: only {bars3}/40 ready — MACD needs 40 bars")
+    if S["adx"] < 25 and S["adx"] > 0:
+        blockers.append(f"ADX {S['adx']:.1f} below 25 — market is choppy, no trade")
+    if S["vol_ratio"] < 1.5 and S["vol_ratio"] > 0:
+        blockers.append(f"Volume {S['vol_ratio']:.1f}x average — need 1.5x minimum")
+    if S["spot"] == 0:
+        blockers.append("No market data — candles not fetched yet")
+    time_ok = (h == 9 and m >= 30) or (10 <= h <= 13) or (h == 14 and m == 0)
+    if not time_ok:
+        if h < 9 or (h == 9 and m < 30):
+            blockers.append(f"Too early — trading starts at 9:30 AM (now {h:02d}:{m:02d})")
+        else:
+            blockers.append(f"After 2:00 PM — trading day over (now {h:02d}:{m:02d})")
+    if S["today_trades"] >= S["max_trades"]:
+        blockers.append(f"Max trades reached ({S['today_trades']}/{S['max_trades']}) for today")
+    if S["daily_pnl"] <= -S["max_daily_loss"]:
+        blockers.append("Daily loss limit hit — no more trades")
+    if S["daily_pnl"] >= S["max_daily_profit"]:
+        blockers.append("Daily profit target hit — locked in")
+    if not S["auto_mode"]:
+        blockers.append("AUTO mode is OFF — enable it to allow auto execution")
+
+    sig = S["signal"] or {}
+    bc = sig.get("buy_count", 0)
+    sc = sig.get("sell_count", 0)
+    conf = sig.get("confidence", 0)
+    if bc > 0 or sc > 0:
+        if max(bc, sc) < 6:
+            blockers.append(f"Only {max(bc,sc)}/9 filters agree — need minimum 6")
+        if conf > 0 and conf < 80:
+            blockers.append(f"Confidence {conf}% below 80% threshold")
+
+    if not blockers:
+        blockers.append("All systems GO — waiting for 6+ filters to align on same direction")
+
+    return blockers
+
 # ─── HTTP SERVER ──────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
@@ -851,6 +906,45 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({k: v for k, v in S.items() if k != "token"})
         elif path == "/api/signal":
             self.send_json(S["signal"] or _wait("No signal yet"))
+        elif path == "/api/diagnostics":
+            now = datetime.now()
+            sig = S["signal"] or {}
+            self.send_json({
+                "timestamp":    now.strftime("%H:%M:%S"),
+                "server_alive": True,
+                "connected":    S["connected"],
+                "paper_mode":   S["paper_mode"],
+                "auto_mode":    S["auto_mode"],
+                "spot":         S["spot"],
+                "last_scan":    S["last_scan"],
+                "candles": {
+                    "3min":  {"bars": len(CANDLES["3m"]),  "ready": len(CANDLES["3m"])  >= 40, "need": 40},
+                    "5min":  {"bars": len(CANDLES["5m"]),  "ready": len(CANDLES["5m"])  >= 20, "need": 20},
+                    "15min": {"bars": len(CANDLES["15m"]), "ready": len(CANDLES["15m"]) >= 57, "need": 57},
+                },
+                "indicators": {
+                    "ema21_15m":     {"value": round(S["ema21_15m"],1),     "ready": S["ema21_15m"] > 0},
+                    "ema55_15m":     {"value": round(S["ema55_15m"],1),     "ready": S["ema55_15m"] > 0},
+                    "supertrend":    {"value": round(S["supertrend_5m"],1), "ready": S["supertrend_5m"] > 0, "dir": S["supertrend_dir"]},
+                    "vwap":          {"value": round(S["vwap"],1),          "ready": S["vwap"] > 0},
+                    "adx":           {"value": round(S["adx"],1),           "ready": S["adx"] > 0, "trending": S["adx"] >= 25},
+                    "rsi":           {"value": round(S["rsi"],1),           "ready": True},
+                    "macd_hist":     {"value": round(S["macd_hist"],2),     "ready": S["macd_hist"] != 0, "cross": S["macd_cross"]},
+                    "pcr":           {"value": round(S["pcr"],2),           "ready": S["pcr"] != 1.0},
+                    "vol_ratio":     {"value": round(S["vol_ratio"],2),     "ready": True, "strong": S["vol_ratio"] >= 1.5},
+                },
+                "signal": {
+                    "direction":  sig.get("direction","WAIT"),
+                    "confidence": sig.get("confidence",0),
+                    "reason":     sig.get("reason",""),
+                    "buy_count":  sig.get("buy_count",0),
+                    "sell_count": sig.get("sell_count",0),
+                },
+                "blockers":      _get_blockers(),
+                "recent_errors": S["errors"][:5],
+                "today_trades":  S["today_trades"],
+                "daily_pnl":     S["daily_pnl"],
+            })
         elif path == "/api/funds":
             self.send_json(self.run_async(dget("/v2/fundlimit")) or {})
         elif path == "/api/positions":
