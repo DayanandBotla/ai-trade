@@ -9,14 +9,14 @@ Run     : python app.py
 Deploy  : Railway.app / Render.com / any VPS
 """
 
-import httpx, asyncio, time, json, threading, socket, math
+import httpx, asyncio, time, json, threading, socket, math, os
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
 DHAN_BASE = "https://api.dhan.co"
 NSE_URL   = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-PORT      = 8000
+PORT      = int(os.environ.get("PORT", 8000))  # Railway injects PORT automatically
 
 # ─── STATE ────────────────────────────────────────────────────────
 S = {
