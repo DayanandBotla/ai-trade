@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -171,6 +172,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
   <div class="nav-item on" onclick="page('dashboard',this)" id="nav-dashboard"><span class="nav-icon">⚡</span>Dashboard</div>
   <div class="nav-item" onclick="page('signal',this)" id="nav-signal"><span class="nav-icon">🎯</span>Signal</div>
   <div class="nav-item" onclick="page('filters',this)" id="nav-filters"><span class="nav-icon">🔬</span>9 Filters</div>
+  <div class="nav-item" onclick="page('diagnostics',this)" id="nav-diagnostics"><span class="nav-icon">🩺</span>Diagnostics</div>
   <div class="sidebar-section">POSITION</div>
   <div class="nav-item" onclick="page('position',this)" id="nav-position"><span class="nav-icon">📊</span>Position</div>
   <div class="nav-item" onclick="page('log',this)" id="nav-log"><span class="nav-icon">📋</span>Trade Log</div>
@@ -453,6 +455,19 @@ tr:hover td{background:rgba(255,255,255,.02)}
   </div>
 </div>
 
+
+<!-- ── DIAGNOSTICS ────────────────────────────────────────────── -->
+<div class="page" id="page-diagnostics">
+  <div class="card" style="border-color:rgba(61,158,255,.2)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <div class="card-title" style="color:var(--b);margin:0">🩺 LIVE SCANNER DIAGNOSTICS</div>
+      <button class="btn btn-b" onclick="refreshDiag()" style="font-size:10px;padding:6px 14px">⟳ REFRESH</button>
+    </div>
+    <div id="diag-content">
+      <div style="text-align:center;padding:30px;color:var(--m);font-family:Share Tech Mono;font-size:10px">Click REFRESH to load diagnostics...</div>
+    </div>
+  </div>
+</div>
 </div><!-- /main -->
 </div><!-- /layout -->
 
@@ -847,6 +862,129 @@ async function fetchLive(url){
   try{document.getElementById('live-data').textContent=JSON.stringify(await api(url),null,2);}
   catch(e){document.getElementById('live-data').textContent='Error';}
 }
+
+
+async function refreshDiag(){
+  const el = document.getElementById('diag-content');
+  el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--m);font-family:Share Tech Mono;font-size:10px">Loading...</div>';
+  try{
+    const d = await api('/api/diagnostics');
+    const ok  = s => `<span style="color:var(--g);font-weight:700">✓ ${s}</span>`;
+    const bad = s => `<span style="color:var(--r);font-weight:700">✗ ${s}</span>`;
+    const warn= s => `<span style="color:var(--y);font-weight:700">⚠ ${s}</span>`;
+
+    // Candle status
+    const cRows = Object.entries(d.candles).map(([k,v])=>`
+      <div class="filter-row">
+        <span class="ficon">📊</span>
+        <div style="flex:1"><div class="fname">${k} Candles</div><div class="fsub">Need ${v.need} bars for indicators</div></div>
+        <div style="text-align:right">
+          ${v.ready ? ok(v.bars+' bars') : warn(v.bars+'/'+v.need+' bars')}
+          <div class="score-bar" style="width:70px;margin-top:4px">
+            <div class="score-fill" style="width:${Math.min(100,v.bars/v.need*100).toFixed(0)}%;background:${v.ready?'var(--g)':'var(--y)'}"></div>
+          </div>
+        </div>
+      </div>`).join('');
+
+    // Indicator status
+    const ind = d.indicators;
+    const iRows = [
+      ['EMA 21 (15m)', ind.ema21_15m.value, ind.ema21_15m.ready, ''],
+      ['EMA 55 (15m)', ind.ema55_15m.value, ind.ema55_15m.ready, ''],
+      ['Supertrend (5m)', ind.supertrend.value+' '+ind.supertrend.dir, ind.supertrend.ready, ''],
+      ['VWAP (5m)', ind.vwap.value, ind.vwap.ready, ''],
+      ['ADX', ind.adx.value, ind.adx.ready, ind.adx.trending?'Trending ✓':'Below 25 — choppy ⚠'],
+      ['RSI (3m)', ind.rsi.value, true, ''],
+      ['MACD Hist (3m)', ind.macd_hist.value+' cross='+ind.macd_hist.cross, ind.macd_hist.ready, ''],
+      ['PCR', ind.pcr.value, ind.pcr.ready, ''],
+      ['Volume Ratio', ind.vol_ratio.value+'x', true, ind.vol_ratio.strong?'Strong ✓':'Low ⚠'],
+    ].map(([name,val,ready,note])=>`
+      <div class="filter-row">
+        <span class="ficon">${ready?'🟢':'🟡'}</span>
+        <div style="flex:1"><div class="fname">${name}</div><div class="fsub">${note}</div></div>
+        <div style="text-align:right;font-family:Share Tech Mono;font-size:11px;color:${ready?'var(--g)':'var(--y)'}">
+          ${val}
+        </div>
+      </div>`).join('');
+
+    // Signal status
+    const sig = d.signal;
+    const sigCol = sig.direction==='BUY'?'var(--g)':sig.direction==='SELL'?'var(--r)':'var(--y)';
+
+    // Blockers
+    const blockerRows = (d.blockers||[]).map(b=>`
+      <div style="display:flex;align-items:flex-start;gap:8px;padding:7px 10px;background:rgba(0,0,0,.2);border-radius:6px;margin-bottom:5px">
+        <span style="color:var(--r);flex-shrink:0">⛔</span>
+        <span style="font-size:10px;font-family:Share Tech Mono;color:var(--m)">${b}</span>
+      </div>`).join('');
+
+    // Errors
+    const errRows = (d.recent_errors||[]).length > 0
+      ? (d.recent_errors||[]).map(e=>`<div style="font-size:9px;color:var(--r);font-family:Share Tech Mono;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.03)">${e}</div>`).join('')
+      : '<div style="font-size:10px;color:var(--g);font-family:Share Tech Mono">No errors — clean run ✓</div>';
+
+    el.innerHTML = `
+      <!-- Server Health -->
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px">
+        ${[
+          ['SERVER',   d.server_alive?ok('ALIVE'):bad('DOWN'),         ''],
+          ['DHAN API', d.connected?ok('CONNECTED'):warn('PAPER MODE'), ''],
+          ['AUTO',     d.auto_mode?ok('ON'):warn('OFF'),               ''],
+          ['SPOT',     d.spot>0?ok('₹'+d.spot.toFixed(1)):bad('NO DATA'),''],
+        ].map(([l,v])=>`<div class="stat-box"><div class="stat-lbl">${l}</div><div style="font-size:11px;margin-top:4px">${v}</div></div>`).join('')}
+      </div>
+
+      <!-- Signal Status -->
+      <div class="card" style="background:rgba(0,0,0,.2);margin-bottom:14px;padding:12px">
+        <div class="card-title">CURRENT SIGNAL STATUS</div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div>
+            <div style="font-family:'Bebas Neue';font-size:26px;color:${sigCol}">${sig.direction==='BUY'?'▲ BUY CALL':sig.direction==='SELL'?'▼ BUY PUT':'◆ WAITING'}</div>
+            <div style="font-size:10px;color:var(--m);font-family:Share Tech Mono;margin-top:4px">${sig.reason||'Computing...'}</div>
+          </div>
+          <div style="text-align:center">
+            <div style="font-size:28px;font-weight:700;color:${sig.confidence>=80?'var(--g)':sig.confidence>0?'var(--y)':'var(--m)'}">${sig.confidence||0}%</div>
+            <div style="font-size:9px;color:var(--m);font-family:Share Tech Mono">${sig.buy_count||0} buy / ${sig.sell_count||0} sell filters</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Why no trade -->
+      <div style="margin-bottom:14px">
+        <div class="card-title">WHY NO TRADE YET</div>
+        ${blockerRows || '<div style="color:var(--g);font-size:11px;font-family:Share Tech Mono;padding:8px">All clear — signal can fire!</div>'}
+      </div>
+
+      <!-- Candles -->
+      <div style="margin-bottom:14px">
+        <div class="card-title">CANDLE DATA HEALTH</div>
+        ${cRows}
+        <div style="font-size:9px;color:var(--m);font-family:Share Tech Mono;margin-top:6px;padding:6px">Last scan: ${d.last_scan||'--:--:--'} &nbsp;|&nbsp; Candles refresh every 3 min</div>
+      </div>
+
+      <!-- Indicators -->
+      <div style="margin-bottom:14px">
+        <div class="card-title">INDICATOR VALUES</div>
+        ${iRows}
+      </div>
+
+      <!-- Errors -->
+      <div>
+        <div class="card-title">RECENT ERRORS</div>
+        <div style="background:rgba(0,0,0,.3);border-radius:7px;padding:10px">
+          ${errRows}
+        </div>
+      </div>
+    `;
+  } catch(e) {
+    el.innerHTML = '<div style="color:var(--r);font-family:Share Tech Mono;font-size:10px;padding:16px">Failed to load diagnostics: '+e.message+'</div>';
+  }
+}
+
+// Auto refresh diagnostics every 10s when on that page
+setInterval(()=>{
+  if(document.getElementById('page-diagnostics')?.classList.contains('on')) refreshDiag();
+}, 10000);
 
 // Start
 pollState(); pollSignal();
