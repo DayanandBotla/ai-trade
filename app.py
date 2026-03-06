@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 DHAN_BASE = "https://api.dhan.co"
 NSE_URL   = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-PORT      = int(os.environ.get("PORT", 8000))  # Railway injects PORT automatically
+PORT      = int(os.environ.get("PORT", 8000))
 
 # ─── STATE ────────────────────────────────────────────────────────
 S = {
@@ -26,7 +26,7 @@ S = {
     "auto_mode": False, "paper_mode": True,
     # Market data
     "spot": 0.0, "prev_spot": 0.0,
-    # Indicators (computed from candles)
+    # Indicators
     "ema21_15m": 0, "ema55_15m": 0,
     "supertrend_5m": 0, "supertrend_dir": "WAIT",
     "vwap": 0, "vwap_upper": 0, "vwap_lower": 0,
@@ -43,7 +43,7 @@ S = {
     # Risk
     "lot_size": 65, "max_lots": 1,
     "sl_points": 40, "target_points": 80,
-    "trail_method": "supertrend",  # supertrend / candle_low / fixed
+    "trail_method": "supertrend",
     "max_daily_loss": 5200, "max_daily_profit": 10400,
     "max_trades": 1,
     # Stats
@@ -54,8 +54,142 @@ S = {
     "errors": [],
 }
 
-# Candle store
 CANDLES = {"3m": [], "5m": [], "15m": []}
+
+# ════════════════════════════════════════════
+# PERSISTENCE — survives restarts & token refresh
+# Files rotate daily — each day gets its own file.
+# ════════════════════════════════════════════
+SESSION_FILE = lambda: f"scalper_session_{datetime.now().strftime('%Y-%m-%d')}.json"
+TRADES_FILE  = lambda: f"scalper_trades_{datetime.now().strftime('%Y-%m-%d')}.json"
+CREDS_FILE   = "scalper_creds.json"   # persists client_id + token across restarts
+
+def save_session():
+    """
+    Write trading state to disk.
+    Called: after every trade close, every 5 alerts, on position open.
+    NOTE: token is saved separately in CREDS_FILE — not in session.
+    """
+    try:
+        data = {
+            "date":         datetime.now().strftime("%Y-%m-%d"),
+            "daily_pnl":    S["daily_pnl"],
+            "today_trades": S["today_trades"],
+            "win":          S["win"],
+            "loss":         S["loss"],
+            "position":     S["position"],
+            "auto_mode":    S["auto_mode"],
+            "paper_mode":   S["paper_mode"],
+            # Risk settings (user may have changed via UI)
+            "sl_points":      S["sl_points"],
+            "target_points":  S["target_points"],
+            "max_lots":       S["max_lots"],
+            "max_daily_loss": S["max_daily_loss"],
+            "max_daily_profit":S["max_daily_profit"],
+            "max_trades":     S["max_trades"],
+            "trail_method":   S["trail_method"],
+            "saved_at":     datetime.now().strftime("%H:%M:%S"),
+        }
+        with open(SESSION_FILE(), "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[PERSIST] save_session failed: {e}")
+
+def save_trade(trade):
+    """Immediately append a closed trade to today's trade file."""
+    try:
+        trades = []
+        tf = TRADES_FILE()
+        if os.path.exists(tf):
+            with open(tf) as f:
+                trades = json.load(f)
+        trades.append(trade)
+        with open(tf, "w") as f:
+            json.dump(trades, f, indent=2)
+    except Exception as e:
+        print(f"[PERSIST] save_trade failed: {e}")
+
+def save_creds():
+    """
+    Save client_id + token to disk.
+    This is the key difference from NiftyEdge — credentials are
+    entered at runtime via /api/connect, not via env vars.
+    Saved separately so token refresh doesn't wipe trade data.
+    """
+    try:
+        with open(CREDS_FILE, "w") as f:
+            json.dump({
+                "client_id": S["client_id"],
+                "token":     S["token"],
+                "saved_at":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }, f, indent=2)
+    except Exception as e:
+        print(f"[PERSIST] save_creds failed: {e}")
+
+def load_session():
+    """
+    On startup: restore today's session + credentials from disk.
+    Scenario coverage:
+      Railway restart     → credentials + full day state restored
+      Token update        → only update token, keep all trade data
+      Browser refresh     → server state already in memory, instant
+      New day             → new date = fresh session file, stale = ignored
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # ── 1. Restore credentials (client_id + token) ──
+    if os.path.exists(CREDS_FILE):
+        try:
+            with open(CREDS_FILE) as f:
+                creds = json.load(f)
+            S["client_id"] = creds.get("client_id", "")
+            S["token"]     = creds.get("token", "")
+            if S["client_id"] and S["token"]:
+                S["connected"]  = True
+                S["paper_mode"] = False
+                print(f"[PERSIST] ✅ Credentials restored — Client:{S['client_id']}")
+        except Exception as e:
+            print(f"[PERSIST] Creds load failed: {e}")
+
+    # ── 2. Restore today's session ──
+    sf = SESSION_FILE()
+    if os.path.exists(sf):
+        try:
+            with open(sf) as f:
+                data = json.load(f)
+            if data.get("date") == today:
+                S["daily_pnl"]      = data.get("daily_pnl", 0)
+                S["today_trades"]   = data.get("today_trades", 0)
+                S["win"]            = data.get("win", 0)
+                S["loss"]           = data.get("loss", 0)
+                S["auto_mode"]      = data.get("auto_mode", False)
+                S["paper_mode"]     = data.get("paper_mode", True)
+                S["sl_points"]      = data.get("sl_points", S["sl_points"])
+                S["target_points"]  = data.get("target_points", S["target_points"])
+                S["max_lots"]       = data.get("max_lots", S["max_lots"])
+                S["max_daily_loss"] = data.get("max_daily_loss", S["max_daily_loss"])
+                S["max_daily_profit"]= data.get("max_daily_profit", S["max_daily_profit"])
+                S["max_trades"]     = data.get("max_trades", S["max_trades"])
+                S["trail_method"]   = data.get("trail_method", S["trail_method"])
+                # Restore open position if any
+                pos = data.get("position")
+                if pos:
+                    S["position"] = pos
+                    print(f"[PERSIST] ⚠️  Open position restored: {pos.get('strike')}{pos.get('option')} — verify with broker!")
+                pnl = S["daily_pnl"]
+                print(f"[PERSIST] ✅ Session restored — P&L:₹{pnl:.0f} | Trades:{S['today_trades']} | W:{S['win']} L:{S['loss']}")
+        except Exception as e:
+            print(f"[PERSIST] Session load failed: {e}")
+
+    # ── 3. Restore today's trade log ──
+    tf = TRADES_FILE()
+    if os.path.exists(tf):
+        try:
+            with open(tf) as f:
+                S["trade_log"] = json.load(f)
+            print(f"[PERSIST] ✅ {len(S['trade_log'])} trades restored from disk.")
+        except Exception as e:
+            print(f"[PERSIST] Trade log load failed: {e}")
 
 # ─── DHAN API ─────────────────────────────────────────────────────
 def hdrs():
@@ -84,6 +218,9 @@ def log_err(msg):
     S["errors"].insert(0, f"{datetime.now().strftime('%H:%M:%S')} {msg}")
     S["errors"] = S["errors"][:20]
     print(f"[ERR] {msg}")
+    # Save every 5 errors too (catches crashes)
+    if len(S["errors"]) % 5 == 0:
+        save_session()
 
 # ─── CANDLE FETCHER ───────────────────────────────────────────────
 async def fetch_candles(mins, count=80):
@@ -175,7 +312,6 @@ def calc_macd(closes, fast=12, slow=26, sig=9):
     ef = ema(closes, fast); es = ema(closes, slow)
     if not ef or not es: return 0, 0, 0, "NONE"
     mv = round(ef - es, 2)
-    # Build MACD line history
     mh = []
     for i in range(slow, len(closes)):
         e1 = ema(closes[:i], fast); e2 = ema(closes[:i], slow)
@@ -199,7 +335,6 @@ def calc_rsi(closes, p=14):
     return round(100 - (100/(1+ag/al)), 1)
 
 def calc_adx(bars, p=14):
-    """ADX — measures trend strength. >25 = trending, <20 = choppy"""
     if len(bars) < p+2: return 0
     cl = [b["c"] for b in bars]
     hi = [b["h"] for b in bars]
@@ -227,7 +362,6 @@ def calc_bollinger(closes, p=20, k=2.0):
     sd = stdev(closes, p)
     upper = round(mid + k*sd, 2)
     lower = round(mid - k*sd, 2)
-    # Squeeze = bands very tight (< 1% of price)
     width_pct = (upper - lower) / mid * 100
     squeeze = width_pct < 1.0
     return upper, round(mid, 2), lower, squeeze
@@ -266,13 +400,11 @@ def compute_indicators():
     bars5  = CANDLES["5m"]
     bars3  = CANDLES["3m"]
 
-    # 15min — EMA 21 / 55
     if len(bars15) >= 57:
         cl = [b["c"] for b in bars15]
         S["ema21_15m"] = ema(cl, 21) or 0
         S["ema55_15m"] = ema(cl, 55) or 0
 
-    # 5min — Supertrend + VWAP + Bollinger + Volume
     if len(bars5) >= 15:
         cl = [b["c"] for b in bars5]
         sv, sd = calc_supertrend(bars5)
@@ -281,7 +413,6 @@ def compute_indicators():
 
         vv = calc_vwap(bars5)
         S["vwap"] = vv or 0
-        # VWAP bands (1 std dev)
         if vv:
             tps = [(b["h"]+b["l"]+b["c"])/3 for b in bars5]
             tp_mean = sum(tps)/len(tps)
@@ -289,20 +420,15 @@ def compute_indicators():
             S["vwap_upper"] = round(vv + tp_std, 2)
             S["vwap_lower"] = round(vv - tp_std, 2)
 
-        # Bollinger 20,2 on 5min
         bu, bm, bl, bsq = calc_bollinger(cl, 20, 2.0)
         S["bb_upper"] = bu or 0; S["bb_mid"] = bm or 0
         S["bb_lower"] = bl or 0; S["bb_squeeze"] = bsq
 
-        # Volume ratio (current vs 20-bar avg)
         vols = [b["v"] for b in bars5]
         avg_vol = sum(vols[-20:]) / min(20, len(vols))
         S["vol_ratio"] = round(vols[-1] / max(1, avg_vol), 2)
-
-        # ADX on 5min
         S["adx"] = calc_adx(bars5)
 
-    # 3min — MACD + RSI
     if len(bars3) >= 40:
         cl = [b["c"] for b in bars3]
         mv, sv2, hist, cross = calc_macd(cl)
@@ -310,29 +436,17 @@ def compute_indicators():
         S["macd_hist"] = hist; S["macd_cross"] = cross
         S["rsi"] = calc_rsi(cl)
 
-# ─── SIGNAL ENGINE — 9 FILTERS ────────────────────────────────────
-#
-#  SURE SHOT PHILOSOPHY:
-#  ─────────────────────
-#  • Minimum 7 of 9 filters must agree
-#  • ADX must be > 25 (no choppy markets)
-#  • Volume must confirm (1.5x average)
-#  • Confidence must be ≥ 80%
-#  • Only 1 trade per day
-#  • All timeframes must align
-#
-# ─────────────────────────────────────────────────────────────────
-
+# ─── SIGNAL ENGINE ────────────────────────────────────────────────
 def build_signal():
     now = datetime.now()
     h, m = now.hour, now.minute
     spot = S["spot"]
-    if spot == 0: 
+    if spot == 0:
         return _wait("No market data yet")
 
     filters = []
 
-    # ── F1: 15min TREND (EMA 21 vs 55) ──────────────────────────
+    # F1: 15min EMA Trend
     e21 = S["ema21_15m"]; e55 = S["ema55_15m"]
     if e21 > 0 and e55 > 0:
         if e21 > e55 and spot > e21:
@@ -346,7 +460,7 @@ def build_signal():
     else:
         filters.append(("WAIT", 0, "15m EMAs not ready"))
 
-    # ── F2: ADX > 25 (trending market only) ─────────────────────
+    # F2: ADX
     adx = S["adx"]
     if adx >= 30:
         filters.append(("PASS", 90, f"ADX {adx} — Strong trend"))
@@ -357,9 +471,8 @@ def build_signal():
     else:
         filters.append(("WAIT", 0, f"ADX {adx} — Choppy market, SKIP"))
 
-    # ── F3: 5min SUPERTREND ──────────────────────────────────────
-    sd = S["supertrend_dir"]
-    sv = S["supertrend_5m"]
+    # F3: 5min Supertrend
+    sd = S["supertrend_dir"]; sv = S["supertrend_5m"]
     if sd == "UP":
         filters.append(("BUY", 88, f"5m Supertrend UP @ {sv:.0f}"))
     elif sd == "DOWN":
@@ -367,7 +480,7 @@ def build_signal():
     else:
         filters.append(("WAIT", 0, "5m Supertrend not ready"))
 
-    # ── F4: VWAP ─────────────────────────────────────────────────
+    # F4: VWAP
     vv = S["vwap"]; vu = S["vwap_upper"]; vl = S["vwap_lower"]
     if vv > 0:
         gap = abs(spot - vv) / vv * 100
@@ -384,11 +497,10 @@ def build_signal():
     else:
         filters.append(("WAIT", 0, "VWAP not ready"))
 
-    # ── F5: BOLLINGER BANDS ──────────────────────────────────────
+    # F5: Bollinger Bands
     bu = S["bb_upper"]; bl2 = S["bb_lower"]; sq = S["bb_squeeze"]
     if bu > 0:
         if sq:
-            # Squeeze breakout — direction determined by price
             if spot > S["bb_mid"]:
                 filters.append(("BUY", 92, "BB Squeeze breakout UPWARD"))
             else:
@@ -404,7 +516,7 @@ def build_signal():
     else:
         filters.append(("WAIT", 0, "BB not ready"))
 
-    # ── F6: MACD (3min) ──────────────────────────────────────────
+    # F6: MACD (3min)
     cross = S["macd_cross"]; hist = S["macd_hist"]
     mv = S["macd"]; sv2 = S["macd_signal"]
     if cross == "BULLISH" and hist > 0:
@@ -418,7 +530,7 @@ def build_signal():
     else:
         filters.append(("WAIT", 20, f"3m MACD neutral hist={hist:.2f}"))
 
-    # ── F7: RSI ZONE (3min) ──────────────────────────────────────
+    # F7: RSI
     rsi = S["rsi"]
     if rsi > 78:
         filters.append(("SELL", 85, f"RSI {rsi} overbought — avoid buy"))
@@ -433,7 +545,7 @@ def build_signal():
     else:
         filters.append(("SELL", 60, f"RSI {rsi} — bearish momentum"))
 
-    # ── F8: VOLUME CONFIRMATION ──────────────────────────────────
+    # F8: Volume
     vr = S["vol_ratio"]
     if vr >= 2.0:
         filters.append(("PASS", 95, f"Volume {vr:.1f}x avg — Strong institutional"))
@@ -444,10 +556,9 @@ def build_signal():
     else:
         filters.append(("WAIT", 0, f"Volume {vr:.1f}x avg — Low, skip"))
 
-    # ── F9: PCR + OI (option chain) ──────────────────────────────
+    # F9: PCR + OI
     pcr = S["pcr"]; nd = S["net_delta"]; spike = S["oi_spike"]
-    score = 0
-    reasons_oi = []
+    score = 0; reasons_oi = []
     if pcr > 1.25:   score += 35; reasons_oi.append(f"PCR {pcr} bullish")
     elif pcr < 0.75: score -= 35; reasons_oi.append(f"PCR {pcr} bearish")
     else:            reasons_oi.append(f"PCR {pcr} neutral")
@@ -462,19 +573,13 @@ def build_signal():
     else:
         filters.append(("WAIT", 35, oi_reason))
 
-    # ── SCORE ──────────────────────────────────────────────────
-    # PASS filters count for both directions
-    buys  = [f for f in filters if f[0] in ("BUY",  "PASS")]
-    sells = [f for f in filters if f[0] in ("SELL", "PASS")]
+    # ── SCORE ──
     pure_buys  = [f for f in filters if f[0] == "BUY"]
     pure_sells = [f for f in filters if f[0] == "SELL"]
-
-    # Weighted confidence
-    buy_conf  = round(sum(f[1] for f in pure_buys)  / max(1, len(pure_buys)))
-    sell_conf = round(sum(f[1] for f in pure_sells) / max(1, len(pure_sells)))
+    buy_conf   = round(sum(f[1] for f in pure_buys)  / max(1, len(pure_buys)))
+    sell_conf  = round(sum(f[1] for f in pure_sells) / max(1, len(pure_sells)))
 
     direction = "WAIT"; conf = 0
-
     if len(pure_buys) >= 6 and buy_conf >= 75:
         direction = "BUY";  conf = buy_conf
     elif len(pure_sells) >= 6 and sell_conf >= 75:
@@ -484,20 +589,15 @@ def build_signal():
     elif len(pure_sells) == 5 and sell_conf >= 85:
         direction = "SELL"; conf = round(sell_conf * 0.92)
 
-    # Hard gates — these can veto the signal
-    adx_f  = next((f for f in filters if "ADX" in f[2]), None)
-    vol_f  = next((f for f in filters if "Volume" in f[2]), None)
-
+    adx_f = next((f for f in filters if "ADX" in f[2]), None)
+    vol_f = next((f for f in filters if "Volume" in f[2]), None)
     if adx_f and adx_f[0] == "WAIT" and "Choppy" in adx_f[2]:
         return _wait(f"VETOED: {adx_f[2]}")
-
     if vol_f and vol_f[0] == "WAIT":
         return _wait(f"VETOED: {vol_f[2]}")
-
     if conf < 80 and direction != "WAIT":
         return _wait(f"Confidence {conf}% below 80% threshold")
 
-    # Discipline rules
     if S["today_trades"] >= S["max_trades"] and direction != "WAIT":
         return _wait("1 quality trade already taken today")
     if S["daily_pnl"] <= -S["max_daily_loss"]:
@@ -505,14 +605,12 @@ def build_signal():
     if S["daily_pnl"] >= S["max_daily_profit"]:
         return _wait("Daily profit target hit — bank it")
 
-    # Time gate
     exp = is_expiry_today()
     in_time = (h == 9 and m >= 30) or (10 <= h <= 13) or (h == 14 and m == 0)
     if exp: in_time = (h == 9 and m >= 30) or (10 <= h <= 11) or (h == 11 and m <= 30)
     if not in_time and direction != "WAIT":
         return _wait("Outside trading hours" if not exp else "Expiry: stop after 11:30 AM")
 
-    # Strike & levels
     atm = round(spot / 50) * 50
     opt = "CE" if direction == "BUY" else "PE"
     sl_pts  = S["sl_points"]
@@ -525,21 +623,13 @@ def build_signal():
     S["last_scan"] = now.strftime("%H:%M:%S")
 
     return {
-        "direction":  direction,
-        "confidence": conf,
-        "strike":     atm,
-        "option":     opt,
-        "premium":    premium,
-        "sl":         sl,
-        "target":     tgt,
-        "rr":         rr,
-        "buy_count":  len(pure_buys),
-        "sell_count": len(pure_sells),
+        "direction":  direction, "confidence": conf,
+        "strike":     atm, "option": opt,
+        "premium":    premium, "sl": sl, "target": tgt, "rr": rr,
+        "buy_count":  len(pure_buys), "sell_count": len(pure_sells),
         "is_expiry":  exp,
         "filters":    [{"dir":f[0],"score":f[1],"reason":f[2]} for f in filters],
-        "spot":       spot,
-        "time":       now.strftime("%H:%M:%S"),
-        "score":      conf,
+        "spot":       spot, "time": now.strftime("%H:%M:%S"), "score": conf,
     }
 
 def _wait(reason):
@@ -585,84 +675,48 @@ def expiry_str():
     m = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
     return f"{e.year%100}{m[e.month-1]}{e.day:02d}"
 
-# ─── TRAILING STOP LOGIC ──────────────────────────────────────────
+# ─── TRAILING STOP ────────────────────────────────────────────────
 def update_trail_sl(pos, ltp):
-    """
-    3 trailing stop methods:
-    1. supertrend  — trail SL = Supertrend value (follows trend)
-    2. candle_low  — trail SL = previous candle's low/high
-    3. fixed       — trail SL moves up by fixed % of profit
-    """
     method = S["trail_method"]
     current_sl = pos["trail_sl"]
-
     if method == "supertrend":
         st_val = S["supertrend_5m"]
         if st_val > 0:
             if pos["side"] == "BUY":
-                new_sl = st_val - 5  # slight buffer below ST
-                pos["trail_sl"] = max(current_sl, new_sl)
+                pos["trail_sl"] = max(current_sl, st_val - 5)
             else:
-                new_sl = st_val + 5
-                pos["trail_sl"] = min(current_sl, new_sl)
-
+                pos["trail_sl"] = min(current_sl, st_val + 5)
     elif method == "candle_low":
         bars = CANDLES["5m"]
         if len(bars) >= 2:
             if pos["side"] == "BUY":
-                prev_low = bars[-2]["l"]
-                new_sl = prev_low - 2
-                pos["trail_sl"] = max(current_sl, new_sl)
+                pos["trail_sl"] = max(current_sl, bars[-2]["l"] - 2)
             else:
-                prev_high = bars[-2]["h"]
-                new_sl = prev_high + 2
-                pos["trail_sl"] = min(current_sl, new_sl)
-
+                pos["trail_sl"] = min(current_sl, bars[-2]["h"] + 2)
     elif method == "fixed":
         profit = ltp - pos["entry"] if pos["side"] == "BUY" else pos["entry"] - ltp
         if profit > 20:
-            lock_pct = 0.5  # lock 50% of profit
             if pos["side"] == "BUY":
-                new_sl = pos["entry"] + profit * lock_pct
-                pos["trail_sl"] = max(current_sl, new_sl)
+                pos["trail_sl"] = max(current_sl, pos["entry"] + profit * 0.5)
             else:
-                new_sl = pos["entry"] - profit * lock_pct
-                pos["trail_sl"] = min(current_sl, new_sl)
-
+                pos["trail_sl"] = min(current_sl, pos["entry"] - profit * 0.5)
     return pos
 
 def check_exit(pos, ltp):
-    """Returns (should_exit, reason)"""
     side = pos["side"]
-
-    # Hard SL / Target
     if side == "BUY":
-        if ltp <= pos["trail_sl"]:
-            return True, "TRAIL SL HIT"
-        if ltp >= pos["target"]:
-            return True, "TARGET HIT"
+        if ltp <= pos["trail_sl"]: return True, "TRAIL SL HIT"
+        if ltp >= pos["target"]:   return True, "TARGET HIT"
     else:
-        if ltp >= pos["trail_sl"]:
-            return True, "TRAIL SL HIT"
-        if ltp <= pos["target"]:
-            return True, "TARGET HIT"
-
-    # Supertrend flip exit
-    if side == "BUY"  and S["supertrend_dir"] == "DOWN":
-        return True, "SUPERTREND FLIPPED — exit"
-    if side == "SELL" and S["supertrend_dir"] == "UP":
-        return True, "SUPERTREND FLIPPED — exit"
-
-    # RSI divergence warning exit
+        if ltp >= pos["trail_sl"]: return True, "TRAIL SL HIT"
+        if ltp <= pos["target"]:   return True, "TARGET HIT"
+    if side == "BUY"  and S["supertrend_dir"] == "DOWN": return True, "SUPERTREND FLIPPED"
+    if side == "SELL" and S["supertrend_dir"] == "UP":   return True, "SUPERTREND FLIPPED"
     rsi = S["rsi"]
     if side == "BUY"  and rsi > 80: return True, "RSI OVERBOUGHT EXIT"
     if side == "SELL" and rsi < 20: return True, "RSI OVERSOLD EXIT"
-
-    # Time-based exit — 2:15 PM cutoff
     now = datetime.now()
-    if now.hour == 14 and now.minute >= 15:
-        return True, "TIME EXIT — 2:15 PM"
-
+    if now.hour == 14 and now.minute >= 15: return True, "TIME EXIT — 2:15 PM"
     return False, ""
 
 # ─── ORDER MANAGEMENT ─────────────────────────────────────────────
@@ -699,21 +753,23 @@ async def enter_trade(sig):
         sl  = entry_price + sl_pts
         tgt = entry_price - tgt_pts
     S["position"] = {
-        "side":       sig["direction"],
-        "strike":     sig["strike"],
-        "option":     sig["option"],
-        "entry":      entry_price,
-        "lots":       S["max_lots"],
-        "sl":         sl,
-        "trail_sl":   sl,
-        "target":     tgt,
-        "entry_time": datetime.now().strftime("%H:%M:%S"),
-        "order_id":   res.get("orderId", ""),
-        "peak_pnl":   0,
+        "side":        sig["direction"],
+        "strike":      sig["strike"],
+        "option":      sig["option"],
+        "entry":       entry_price,
+        "lots":        S["max_lots"],
+        "sl":          sl,
+        "trail_sl":    sl,
+        "target":      tgt,
+        "entry_time":  datetime.now().strftime("%H:%M:%S"),
+        "order_id":    res.get("orderId", ""),
+        "peak_pnl":    0,
         "current_ltp": entry_price,
     }
     S["today_trades"] += 1
     print(f"[ENTRY] {sig['direction']} {sig['strike']}{sig['option']} @ {entry_price}")
+    # ── PERSIST: save immediately when position opens ──
+    save_session()
 
 async def exit_trade(exit_price, reason):
     pos = S["position"]
@@ -729,7 +785,8 @@ async def exit_trade(exit_price, reason):
     S["daily_pnl"] += pnl
     if pnl > 0: S["win"] += 1
     else:       S["loss"] += 1
-    S["trade_log"].insert(0, {
+
+    trade_record = {
         "time":   datetime.now().strftime("%H:%M:%S"),
         "side":   pos["side"],
         "strike": f"{pos['strike']}{pos['option']}",
@@ -738,8 +795,15 @@ async def exit_trade(exit_price, reason):
         "pnl":    round(pnl, 0),
         "lots":   pos["lots"],
         "reason": reason,
-    })
+    }
+    S["trade_log"].insert(0, trade_record)
     S["position"] = None
+
+    # ── PERSIST: write trade to disk immediately ──
+    save_trade(trade_record)
+    # ── PERSIST: save full session after close ──
+    save_session()
+
     print(f"[EXIT] {reason} @ {exit_price:.0f} PnL=Rs{pnl:.0f}")
 
 async def fetch_ltp(strike, opt):
@@ -758,42 +822,30 @@ async def scanner():
     while True:
         try:
             now_ts = time.time()
-
-            # Refresh candles every 3 min
             if now_ts - t_candle >= 180:
                 if S["token"]: await refresh_candles()
                 t_candle = now_ts
-
-            # Refresh NSE option chain every 90s
             if now_ts - t_nse >= 90:
                 await fetch_nse(); t_nse = now_ts
 
-            # Compute all indicators
             compute_indicators()
-
-            # Build signal
             sig = build_signal()
             S["signal"] = sig
 
-            # Auto execute
             if S["auto_mode"] and sig["direction"] != "WAIT" and not S["position"]:
                 await enter_trade(sig)
 
-            # Monitor position
             if S["position"]:
                 pos = S["position"]
                 ltp = await fetch_ltp(pos["strike"], pos["option"])
                 if ltp is None: ltp = pos["entry"]
                 pos["current_ltp"] = ltp
-                # Update peak PnL
                 if pos["side"] == "BUY":
                     cur_pnl = (ltp - pos["entry"]) * pos["lots"] * S["lot_size"]
                 else:
                     cur_pnl = (pos["entry"] - ltp) * pos["lots"] * S["lot_size"]
                 pos["peak_pnl"] = max(pos.get("peak_pnl", 0), cur_pnl)
-                # Update trailing stop
                 update_trail_sl(pos, ltp)
-                # Check exit
                 should_exit, reason = check_exit(pos, ltp)
                 if should_exit:
                     await exit_trade(ltp, reason)
@@ -803,59 +855,45 @@ async def scanner():
 
         await asyncio.sleep(5)
 
-
-# ─── DIAGNOSTICS HELPER ───────────────────────────────────────────
+# ─── DIAGNOSTICS ─────────────────────────────────────────────────
 def _get_blockers():
-    """Returns list of reasons why no trade is firing right now"""
-    now = datetime.now()
-    h, m = now.hour, now.minute
+    now = datetime.now(); h, m = now.hour, now.minute
     blockers = []
-    bars3  = len(CANDLES["3m"])
-    bars5  = len(CANDLES["5m"])
-    bars15 = len(CANDLES["15m"])
-
+    bars3 = len(CANDLES["3m"]); bars5 = len(CANDLES["5m"]); bars15 = len(CANDLES["15m"])
     if not S["connected"]:
         blockers.append("NOT CONNECTED — enter Dhan token in Settings")
     if bars15 < 57:
-        blockers.append(f"15min candles: only {bars15}/57 ready — need more time")
+        blockers.append(f"15min candles: only {bars15}/57 ready")
     if bars5 < 20:
         blockers.append(f"5min candles: only {bars5}/20 ready")
     if bars3 < 40:
         blockers.append(f"3min candles: only {bars3}/40 ready — MACD needs 40 bars")
     if S["adx"] < 25 and S["adx"] > 0:
-        blockers.append(f"ADX {S['adx']:.1f} below 25 — market is choppy, no trade")
+        blockers.append(f"ADX {S['adx']:.1f} below 25 — choppy market")
     if S["vol_ratio"] < 1.5 and S["vol_ratio"] > 0:
-        blockers.append(f"Volume {S['vol_ratio']:.1f}x average — need 1.5x minimum")
+        blockers.append(f"Volume {S['vol_ratio']:.1f}x — need 1.5x minimum")
     if S["spot"] == 0:
-        blockers.append("No market data — candles not fetched yet")
+        blockers.append("No market data")
     time_ok = (h == 9 and m >= 30) or (10 <= h <= 13) or (h == 14 and m == 0)
     if not time_ok:
-        if h < 9 or (h == 9 and m < 30):
-            blockers.append(f"Too early — trading starts at 9:30 AM (now {h:02d}:{m:02d})")
-        else:
-            blockers.append(f"After 2:00 PM — trading day over (now {h:02d}:{m:02d})")
+        blockers.append(f"Outside trading hours (now {h:02d}:{m:02d})")
     if S["today_trades"] >= S["max_trades"]:
-        blockers.append(f"Max trades reached ({S['today_trades']}/{S['max_trades']}) for today")
+        blockers.append(f"Max trades reached ({S['today_trades']}/{S['max_trades']})")
     if S["daily_pnl"] <= -S["max_daily_loss"]:
-        blockers.append("Daily loss limit hit — no more trades")
+        blockers.append("Daily loss limit hit")
     if S["daily_pnl"] >= S["max_daily_profit"]:
-        blockers.append("Daily profit target hit — locked in")
+        blockers.append("Daily profit target hit")
     if not S["auto_mode"]:
-        blockers.append("AUTO mode is OFF — enable it to allow auto execution")
-
+        blockers.append("AUTO mode OFF")
     sig = S["signal"] or {}
-    bc = sig.get("buy_count", 0)
-    sc = sig.get("sell_count", 0)
-    conf = sig.get("confidence", 0)
+    bc = sig.get("buy_count", 0); sc = sig.get("sell_count", 0); conf = sig.get("confidence", 0)
     if bc > 0 or sc > 0:
         if max(bc, sc) < 6:
-            blockers.append(f"Only {max(bc,sc)}/9 filters agree — need minimum 6")
+            blockers.append(f"Only {max(bc,sc)}/9 filters agree — need 6")
         if conf > 0 and conf < 80:
-            blockers.append(f"Confidence {conf}% below 80% threshold")
-
+            blockers.append(f"Confidence {conf}% below 80%")
     if not blockers:
-        blockers.append("All systems GO — waiting for 6+ filters to align on same direction")
-
+        blockers.append("All systems GO — waiting for 6+ filters to align")
     return blockers
 
 # ─── HTTP SERVER ──────────────────────────────────────────────────
@@ -907,31 +945,27 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/signal":
             self.send_json(S["signal"] or _wait("No signal yet"))
         elif path == "/api/diagnostics":
-            now = datetime.now()
-            sig = S["signal"] or {}
+            now = datetime.now(); sig = S["signal"] or {}
             self.send_json({
-                "timestamp":    now.strftime("%H:%M:%S"),
-                "server_alive": True,
-                "connected":    S["connected"],
-                "paper_mode":   S["paper_mode"],
-                "auto_mode":    S["auto_mode"],
-                "spot":         S["spot"],
-                "last_scan":    S["last_scan"],
+                "timestamp": now.strftime("%H:%M:%S"),
+                "server_alive": True, "connected": S["connected"],
+                "paper_mode": S["paper_mode"], "auto_mode": S["auto_mode"],
+                "spot": S["spot"], "last_scan": S["last_scan"],
                 "candles": {
-                    "3min":  {"bars": len(CANDLES["3m"]),  "ready": len(CANDLES["3m"])  >= 40, "need": 40},
-                    "5min":  {"bars": len(CANDLES["5m"]),  "ready": len(CANDLES["5m"])  >= 20, "need": 20},
-                    "15min": {"bars": len(CANDLES["15m"]), "ready": len(CANDLES["15m"]) >= 57, "need": 57},
+                    "3min":  {"bars": len(CANDLES["3m"]),  "ready": len(CANDLES["3m"])  >= 40},
+                    "5min":  {"bars": len(CANDLES["5m"]),  "ready": len(CANDLES["5m"])  >= 20},
+                    "15min": {"bars": len(CANDLES["15m"]), "ready": len(CANDLES["15m"]) >= 57},
                 },
                 "indicators": {
-                    "ema21_15m":     {"value": round(S["ema21_15m"],1),     "ready": S["ema21_15m"] > 0},
-                    "ema55_15m":     {"value": round(S["ema55_15m"],1),     "ready": S["ema55_15m"] > 0},
-                    "supertrend":    {"value": round(S["supertrend_5m"],1), "ready": S["supertrend_5m"] > 0, "dir": S["supertrend_dir"]},
-                    "vwap":          {"value": round(S["vwap"],1),          "ready": S["vwap"] > 0},
-                    "adx":           {"value": round(S["adx"],1),           "ready": S["adx"] > 0, "trending": S["adx"] >= 25},
-                    "rsi":           {"value": round(S["rsi"],1),           "ready": True},
-                    "macd_hist":     {"value": round(S["macd_hist"],2),     "ready": S["macd_hist"] != 0, "cross": S["macd_cross"]},
-                    "pcr":           {"value": round(S["pcr"],2),           "ready": S["pcr"] != 1.0},
-                    "vol_ratio":     {"value": round(S["vol_ratio"],2),     "ready": True, "strong": S["vol_ratio"] >= 1.5},
+                    "ema21_15m":  {"value": round(S["ema21_15m"],1),     "ready": S["ema21_15m"] > 0},
+                    "ema55_15m":  {"value": round(S["ema55_15m"],1),     "ready": S["ema55_15m"] > 0},
+                    "supertrend": {"value": round(S["supertrend_5m"],1), "ready": S["supertrend_5m"] > 0, "dir": S["supertrend_dir"]},
+                    "vwap":       {"value": round(S["vwap"],1),          "ready": S["vwap"] > 0},
+                    "adx":        {"value": round(S["adx"],1),           "ready": S["adx"] > 0, "trending": S["adx"] >= 25},
+                    "rsi":        {"value": round(S["rsi"],1),           "ready": True},
+                    "macd_hist":  {"value": round(S["macd_hist"],2),     "ready": S["macd_hist"] != 0, "cross": S["macd_cross"]},
+                    "pcr":        {"value": round(S["pcr"],2),           "ready": S["pcr"] != 1.0},
+                    "vol_ratio":  {"value": round(S["vol_ratio"],2),     "ready": True, "strong": S["vol_ratio"] >= 1.5},
                 },
                 "signal": {
                     "direction":  sig.get("direction","WAIT"),
@@ -951,6 +985,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(self.run_async(dget("/v2/positions")) or [])
         elif path == "/api/orders":
             self.send_json(self.run_async(dget("/v2/orders")) or [])
+        # ── PERSIST: export today's trades ──
+        elif path == "/api/session/export":
+            tf = TRADES_FILE()
+            trades = []
+            if os.path.exists(tf):
+                with open(tf) as f: trades = json.load(f)
+            wins   = [t for t in trades if t.get("pnl", 0) > 0]
+            losses = [t for t in trades if t.get("pnl", 0) <= 0]
+            self.send_json({
+                "date":    datetime.now().strftime("%Y-%m-%d"),
+                "trades":  trades,
+                "summary": {
+                    "total_trades": len(trades),
+                    "wins":         len(wins),
+                    "losses":       len(losses),
+                    "win_rate":     round(len(wins)/len(trades)*100,1) if trades else 0,
+                    "gross_win":    round(sum(t["pnl"] for t in wins), 2),
+                    "gross_loss":   round(sum(t["pnl"] for t in losses), 2),
+                    "net_pnl":      round(sum(t.get("pnl",0) for t in trades), 2),
+                }
+            })
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -964,6 +1019,8 @@ class Handler(BaseHTTPRequestHandler):
             r = self.run_async(dget("/v2/fundlimit"))
             if r:
                 S["connected"] = True; S["paper_mode"] = False
+                # ── PERSIST: save credentials immediately on connect ──
+                save_creds()
                 self.send_json({"status": "connected", "funds": r})
             else:
                 S["connected"] = False
@@ -971,17 +1028,21 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/disconnect":
             S["connected"] = False; S["token"] = ""; S["paper_mode"] = True
+            # ── PERSIST: wipe saved credentials on disconnect ──
+            if os.path.exists(CREDS_FILE):
+                try: os.remove(CREDS_FILE)
+                except: pass
             self.send_json({"status": "disconnected"})
 
         elif path == "/api/auto/on":
-            S["auto_mode"] = True; self.send_json({"auto_mode": True})
+            S["auto_mode"] = True;  save_session(); self.send_json({"auto_mode": True})
         elif path == "/api/auto/off":
-            S["auto_mode"] = False; self.send_json({"auto_mode": False})
+            S["auto_mode"] = False; save_session(); self.send_json({"auto_mode": False})
 
         elif path == "/api/paper/on":
-            S["paper_mode"] = True; self.send_json({"paper_mode": True})
+            S["paper_mode"] = True;  save_session(); self.send_json({"paper_mode": True})
         elif path == "/api/paper/off":
-            S["paper_mode"] = False; self.send_json({"paper_mode": False})
+            S["paper_mode"] = False; save_session(); self.send_json({"paper_mode": False})
 
         elif path == "/api/scan":
             self.run_async(fetch_nse())
@@ -1011,15 +1072,33 @@ class Handler(BaseHTTPRequestHandler):
             for k in ["sl_points","target_points","max_lots","max_daily_loss",
                       "max_daily_profit","max_trades","trail_method"]:
                 if k in body: S[k] = body[k]
+            # ── PERSIST: save settings change immediately ──
+            save_session()
             self.send_json({"status": "saved"})
+
+        elif path == "/api/reset":
+            # Wipe today's disk files and reset stats
+            S["daily_pnl"] = 0; S["today_trades"] = 0
+            S["win"] = 0; S["loss"] = 0
+            S["trade_log"] = []; S["position"] = None
+            for f in [SESSION_FILE(), TRADES_FILE()]:
+                try:
+                    if os.path.exists(f): os.remove(f)
+                except: pass
+            self.send_json({"status": "reset"})
+
+        elif path == "/api/session/save":
+            # ── PERSIST: manual force save ──
+            save_session()
+            self.send_json({"status": "saved", "time": datetime.now().strftime("%H:%M:%S")})
 
         else:
             self.send_json({"error": "not found"}, 404)
 
 # ─── FRONTEND ─────────────────────────────────────────────────────
-HTML = open("ui.html", encoding="utf-8").read() if __import__("os").path.exists("ui.html") else "<h1>UI not found</h1>"
+HTML = open("ui.html", encoding="utf-8").read() if os.path.exists("ui.html") else "<h1>UI not found</h1>"
 
-# ─── ENTRY POINT ─────────────────────────────────────────────────
+# ─── ENTRY POINT ──────────────────────────────────────────────────
 if __name__ == "__main__":
     try: ip = socket.gethostbyname(socket.gethostname())
     except: ip = "localhost"
@@ -1030,6 +1109,9 @@ if __name__ == "__main__":
     print(f"  Network: http://{ip}:{PORT}")
     print("  Only requires: httpx")
     print("="*50 + "\n")
+
+    # ── PERSIST: restore session before scanner starts ──
+    load_session()
 
     def run_bg():
         loop = asyncio.new_event_loop()
