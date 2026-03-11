@@ -71,10 +71,15 @@ S = {
     "setup_type":      None,
     "setup_score":     0,       # 0-100 quality score based on structure
 
-    # VWAP Reclaim tracking
+    # VWAP Reclaim tracking (CE — TREND_UP)
     "vwap_was_below":      False,  # price was below VWAP (pullback happened)
     "vwap_pullback_low":   0.0,    # lowest point during pullback (sets SL)
     "vwap_below_candles":  0,      # how many candles below VWAP
+
+    # VWAP Fade tracking (PE — TREND_DOWN)
+    "vwap_was_above":      False,  # price was above VWAP (rally happened)
+    "vwap_rally_high":     0.0,    # highest point during rally (sets SL)
+    "vwap_above_candles":  0,      # how many candles above VWAP
 
     # EMA Pullback tracking
     "ema_touch_count":     0,      # candles that touched EMA21 zone
@@ -691,6 +696,106 @@ def check_vwap_reclaim():
     return None
 
 # ══════════════════════════════════════════════════════════════════
+# SETUP 2b: VWAP FADE (PE — mirror of VWAP Reclaim for TREND_DOWN)
+# Win rate ~60-68% on TREND_DOWN days.
+# ══════════════════════════════════════════════════════════════════
+def check_vwap_fade():
+    """
+    VWAP Fade trade — the bearish mirror of VWAP Reclaim.
+
+    On TREND_DOWN days, price is below VWAP most of the day.
+    Smart money uses VWAP as resistance, not support.
+
+    Phase 1: Price RALLIES above VWAP for minimum 2 consecutive candles.
+             This is the "dead cat bounce" / short-covering rally.
+    Phase 2: Strong candle CLOSES BACK BELOW VWAP with volume > 1.5x.
+             This is distribution — institutions selling into the rally.
+    Entry:   PE at next candle open.
+    SL:      5pts ABOVE the rally high (if price goes back above — thesis broken).
+    Target:  VWAP - (rally_high - VWAP) × 1.5.
+
+    Valid only on TREND_DOWN days. Not after 12:00 PM.
+    Logic:   The same way bulls buy VWAP pullbacks on up-days,
+             bears sell VWAP rallies on down-days.
+             This is the most reliable bearish intraday setup.
+    """
+    if S["regime"] != "TREND_DOWN": return None
+
+    bars5 = CANDLES["5m"]
+    if len(bars5) < 5: return None
+
+    vwap = S["vwap"]
+    if not vwap: return None
+
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    # Only valid 9:45 AM – 12:00 PM
+    if not (9*60+45 <= h*60+m <= 12*60+0):
+        return None
+
+    if S["today_trades"] >= S["max_trades"]: return None
+
+    cur = bars5[-2]  # last fully closed candle
+
+    # ── Phase 1: Track rally above VWAP ──────────────────────────
+    if cur["c"] > vwap:
+        S["vwap_was_above"]     = True
+        S["vwap_above_candles"] = S["vwap_above_candles"] + 1
+        if cur["h"] > S["vwap_rally_high"] or S["vwap_rally_high"] == 0:
+            S["vwap_rally_high"] = cur["h"]
+        return None
+
+    # ── Phase 2: Price closed back below VWAP ─────────────────────
+    if S["vwap_was_above"] and S["vwap_above_candles"] >= 2 and S["vwap_rally_high"] > 0:
+
+        # Volume confirmation — need strong rejection candle
+        vols  = [b["v"] for b in bars5[:-1]]
+        avg_v = sum(vols[-10:]) / max(1, min(10, len(vols)))
+        vol_ratio = cur["v"] / max(1, avg_v)
+
+        if vol_ratio < 1.5:
+            # Weak rejection — sellers not committed, skip
+            S["vwap_was_above"]     = False
+            S["vwap_above_candles"] = 0
+            S["vwap_rally_high"]    = 0.0
+            return None
+
+        spot_close  = cur["c"]
+        rally_high  = S["vwap_rally_high"]
+        sl_spot     = rally_high + 5                       # SL above rally high
+        tgt_spot    = vwap - (rally_high - vwap) * 1.5    # symmetric target below VWAP
+
+        sl_pts  = round(sl_spot  - spot_close)
+        tgt_pts = round(spot_close - tgt_spot)
+        quality = min(90, 65 + int(vol_ratio * 5))
+
+        reason = (f"VWAP FADE PE — Close:{spot_close:.0f} below VWAP:{vwap:.0f} "
+                  f"| Rally high:{rally_high:.0f} | Vol:{vol_ratio:.1f}x "
+                  f"| SL:{sl_pts}pts above | Tgt:{tgt_pts}pts below")
+
+        # Reset tracker
+        S["vwap_was_above"]     = False
+        S["vwap_above_candles"] = 0
+        S["vwap_rally_high"]    = 0.0
+
+        return {
+            "setup":    "VWAP_FADE",
+            "direction":"BUY",     # We always BUY options (buying PE = bearish bet)
+            "option":   "PE",
+            "sl_spot":  sl_spot,
+            "tgt_spot": tgt_spot,
+            "quality":  quality,
+            "reason":   reason,
+        }
+    else:
+        # Price below VWAP but no prior rally — just tracking, reset if needed
+        if not S["vwap_was_above"]:
+            S["vwap_above_candles"] = 0
+            S["vwap_rally_high"]    = 0.0
+
+    return None
+
+# ══════════════════════════════════════════════════════════════════
 # SETUP 3: EMA21 PULLBACK (Trend Continuation)
 # Win rate ~62-70% on strong trend days (ADX > 30).
 # ══════════════════════════════════════════════════════════════════
@@ -825,22 +930,29 @@ def build_signal():
     # Only one fires per signal cycle.
     setup = None
 
-    # Regime gates:
-    # ORB: all regimes except CHOP
-    # VWAP Reclaim: TREND_UP only
-    # EMA Pullback: TREND_UP + TREND_DOWN + ADX>30
+    # ── Setup priority order ──────────────────────────────────────
+    # ORB        → all regimes (both CE and PE)
+    # VWAP Reclaim → TREND_UP only  (CE)
+    # VWAP Fade    → TREND_DOWN only (PE)  ← NEW
+    # EMA Pullback → TREND_UP + TREND_DOWN, ADX>30 (CE or PE)
     if S["regime"] != "CHOP":
         setup = check_orb_setup()
 
     if not setup and S["regime"] == "TREND_UP":
         setup = check_vwap_reclaim()
 
+    if not setup and S["regime"] == "TREND_DOWN":
+        setup = check_vwap_fade()
+
     if not setup and S["regime"] in ("TREND_UP","TREND_DOWN"):
         setup = check_ema_pullback()
 
     if not setup:
+        vwap_setups = ("ORB/VWAP-Reclaim/EMA" if S["regime"]=="TREND_UP"
+                       else "ORB/VWAP-Fade/EMA" if S["regime"]=="TREND_DOWN"
+                       else "ORB")
         return _wait(
-            f"Regime:{S['regime']} | Watching for ORB/VWAP/EMA setup... "
+            f"Regime:{S['regime']} | Watching for {vwap_setups} setup... "
             f"| OR:{S['orb_high']:.0f}-{S['orb_low']:.0f} | ADX:{S['adx_15m']:.0f}"
             if S["orb_locked"] else
             f"Regime:{S['regime']} | Waiting for opening range to form..."
@@ -1364,7 +1476,7 @@ class Handler(BaseHTTPRequestHandler):
                 "by_setup":{st:{"trades":len([t for t in trades if t.get("setup_type")==st]),
                     "wins":len([t for t in trades if t.get("setup_type")==st and t.get("pnl",0)>0]),
                     "pnl":round(sum(t["pnl"] for t in trades if t.get("setup_type")==st),2)}
-                    for st in ["ORB","VWAP_RECLAIM","EMA_PULLBACK"]},
+                    for st in ["ORB","VWAP_RECLAIM","VWAP_FADE","EMA_PULLBACK"]},
             }})
         else:
             self.send_json({"error":"not found"},404)
@@ -1428,7 +1540,8 @@ class Handler(BaseHTTPRequestHandler):
             S["trade_log"]=[]; S["position"]=None
             S["regime"]="UNKNOWN"; S["orb_locked"]=False
             S["orb_high"]=None; S["orb_low"]=None; S["orb_range"]=0
-            S["vwap_was_below"]=False; S["vwap_pullback_low"]=0
+            S["vwap_was_below"]=False; S["vwap_pullback_low"]=0; S["vwap_below_candles"]=0
+            S["vwap_was_above"]=False; S["vwap_rally_high"]=0.0; S["vwap_above_candles"]=0
             S["setup_type"]=None
             for f in [SESSION_FILE(),TRADES_FILE()]:
                 try:
@@ -1457,10 +1570,11 @@ if __name__=="__main__":
     print(f"  Local  : http://localhost:{PORT}")
     print(f"  Network: http://{ip}:{PORT}")
     print()
-    print("  SIGNAL ENGINE v3.0:")
-    print("  ┌─ Setup 1: ORB Breakout (9:30-11:00 AM, all regimes)")
-    print("  ├─ Setup 2: VWAP Reclaim (9:45-12:00, TREND_UP days)")
-    print("  └─ Setup 3: EMA Pullback (9:45-1:00, ADX>30 trend days)")
+    print("  SIGNAL ENGINE v3.1:")
+    print("  ┌─ Setup 1 : ORB Breakout/Breakdown   (9:30-11:00, all regimes → CE or PE)")
+    print("  ├─ Setup 2a: VWAP Reclaim              (9:45-12:00, TREND_UP only → CE)")
+    print("  ├─ Setup 2b: VWAP Fade                 (9:45-12:00, TREND_DOWN only → PE)")
+    print("  └─ Setup 3 : EMA21 Pullback/Rejection  (9:45-1:00,  ADX>30 → CE or PE)")
     print()
     print("  REGIME DETECTION (9:45 AM):")
     print("  ┌─ CHOP (<80pt OR range)  → NO TRADE — saves capital")
