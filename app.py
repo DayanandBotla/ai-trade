@@ -35,7 +35,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
 DHAN_BASE = "https://api.dhan.co"
-NSE_URL   = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
 PORT      = int(os.environ.get("PORT", 8000))
 
 # ══════════════════════════════════════════════════════════════════
@@ -366,47 +365,133 @@ def compute_indicators():
         S["rsi"]=calc_rsi(cl)
 
 # ══════════════════════════════════════════════════════════════════
-# NSE OPTION CHAIN — REAL option prices
+# DHAN OPTION CHAIN — replaces NSE scraping entirely
+#
+# Dhan API endpoint: POST /v2/optionchain
+# Docs: https://dhanhq.co/docs/v2/option-chain/
+#
+# Why Dhan instead of NSE:
+#   - NSE blocks cloud IPs (Railway = blocked within days)
+#   - NSE requires cookie/session handshake before every fetch
+#   - Dhan is authenticated, stable, no rate-limit issues
+#   - Same token you already use for orders — no extra auth
+#
+# What we get from Dhan option chain:
+#   - last_price      → real ATM LTP (CE and PE)
+#   - oi              → open interest for PCR
+#   - implied_volatility → IV for fallback pricing
+#   - underlying_price → spot price
 # ══════════════════════════════════════════════════════════════════
 async def fetch_nse():
-    h = {"User-Agent":"Mozilla/5.0","Accept":"application/json",
-         "Referer":"https://www.nseindia.com/"}
-    async with httpx.AsyncClient(timeout=15) as c:
-        try:
-            await c.get("https://www.nseindia.com", headers=h)
-            r = await c.get(NSE_URL, headers=h)
-            r.raise_for_status()
-            rec  = r.json()["records"]
-            spot = rec["underlyingValue"]
-            exp  = rec["expiryDates"][0]
-            fd   = [d for d in rec["data"] if d.get("expiryDate")==exp]
+    """
+    Fetch option chain from Dhan API.
+    Called fetch_nse() for backward compat with scanner loop.
+    Populates: spot, atm_ce_ltp, atm_pe_ltp, atm_ce_iv, atm_pe_iv,
+               pcr, net_delta, oi_spike
+    """
+    if not S["token"]:
+        # Paper mode — simulate reasonable option prices from spot
+        spot = S["spot"]
+        if spot > 0:
+            iv   = 15.0
+            days = max(1, (get_expiry() - datetime.now()).days + 1)
+            T    = days / 365
+            est  = round(spot * (iv/100) * math.sqrt(T) * 0.4, 1)
+            S["atm_ce_ltp"] = est
+            S["atm_pe_ltp"] = est
+            print(f"[CHAIN] Paper mode — estimated ATM: ₹{est}")
+        return
 
-            # ── PCR, Delta, OI ──
-            coi = sum(d["CE"]["openInterest"] for d in fd if "CE" in d)
-            poi = sum(d["PE"]["openInterest"] for d in fd if "PE" in d)
-            S["pcr"] = round(poi/max(1,coi),2)
-            S["net_delta"] = int(
-                sum(d["CE"]["openInterest"]*0.5  for d in fd if "CE" in d)+
-                sum(d["PE"]["openInterest"]*-0.5 for d in fd if "PE" in d))
-            max_chg = max((abs(d.get("CE",{}).get("changeinOpenInterest",0)) for d in fd),default=0)
-            S["oi_spike"] = max_chg > 50000
+    try:
+        expiry_date = get_expiry().strftime("%Y-%m-%d")
+        body = {
+            "UnderlyingScrip": 13,          # NIFTY 50 security ID
+            "UnderlyingSeg":   "IDX_I",
+            "ExpiryDate":      expiry_date,
+        }
+        r = await dpost("/v2/optionchain", body)
+
+        if not r:
+            log_err("CHAIN: Dhan option chain returned empty — check token/expiry")
+            return
+
+        # ── Parse Dhan option chain response ──────────────────────
+        # Response structure:
+        # {
+        #   "data": {
+        #     "underlying_price": 22150.5,
+        #     "oc": {
+        #       "22100": {
+        #         "call": {"last_price":120.5, "oi":45000, "implied_volatility":14.2, ...},
+        #         "put":  {"last_price":115.0, "oi":52000, "implied_volatility":14.8, ...}
+        #       },
+        #       "22150": {...},
+        #       ...
+        #     }
+        #   }
+        # }
+
+        data        = r.get("data", r)          # some versions wrap in "data"
+        spot        = float(data.get("underlying_price") or
+                            data.get("last_price") or
+                            S["spot"] or 0)
+        oc          = data.get("oc", {})
+
+        if not oc:
+            log_err(f"CHAIN: 'oc' key missing in response. Keys: {list(data.keys())[:8]}")
+            return
+
+        if spot > 0:
             S["spot"] = spot
 
-            # ── REAL ATM option LTP ── (fixes the spot*0.004 fake premium)
-            atm = round(spot/50)*50
-            S["atm_strike"] = atm
-            for row in fd:
-                if row.get("strikePrice") == atm:
-                    ce = row.get("CE",{}); pe = row.get("PE",{})
-                    S["atm_ce_ltp"] = float(ce.get("lastPrice",0) or 0)
-                    S["atm_pe_ltp"] = float(pe.get("lastPrice",0) or 0)
-                    S["atm_ce_iv"]  = float(ce.get("impliedVolatility",0) or 0)
-                    S["atm_pe_iv"]  = float(pe.get("impliedVolatility",0) or 0)
-                    break
+        atm = round(spot / 50) * 50
+        S["atm_strike"] = atm
 
-            print(f"[NSE] spot={spot} atm={atm} CE={S['atm_ce_ltp']} PE={S['atm_pe_ltp']} PCR={S['pcr']}")
-        except Exception as e:
-            log_err(f"NSE fetch: {e}")
+        # ── ATM LTP and IV ────────────────────────────────────────
+        atm_key = str(int(atm))
+        atm_row = oc.get(atm_key, {})
+
+        ce_data = atm_row.get("call", atm_row.get("CE", {}))
+        pe_data = atm_row.get("put",  atm_row.get("PE", {}))
+
+        ce_ltp = float(ce_data.get("last_price", ce_data.get("lastPrice", 0)) or 0)
+        pe_ltp = float(pe_data.get("last_price", pe_data.get("lastPrice", 0)) or 0)
+        ce_iv  = float(ce_data.get("implied_volatility", ce_data.get("impliedVolatility", 0)) or 0)
+        pe_iv  = float(pe_data.get("implied_volatility", pe_data.get("impliedVolatility", 0)) or 0)
+
+        if ce_ltp > 0: S["atm_ce_ltp"] = ce_ltp
+        if pe_ltp > 0: S["atm_pe_ltp"] = pe_ltp
+        if ce_iv  > 0: S["atm_ce_iv"]  = ce_iv
+        if pe_iv  > 0: S["atm_pe_iv"]  = pe_iv
+
+        # ── PCR, Net Delta, OI Spike from full chain ──────────────
+        total_ce_oi = 0; total_pe_oi = 0
+        max_oi_chg  = 0
+
+        for strike_str, row in oc.items():
+            cd = row.get("call", row.get("CE", {}))
+            pd = row.get("put",  row.get("PE", {}))
+
+            c_oi     = float(cd.get("oi",               cd.get("openInterest",            0)) or 0)
+            p_oi     = float(pd.get("oi",               pd.get("openInterest",            0)) or 0)
+            c_chg_oi = float(cd.get("change_in_oi",     cd.get("changeinOpenInterest",    0)) or 0)
+            p_chg_oi = float(pd.get("change_in_oi",     pd.get("changeinOpenInterest",    0)) or 0)
+
+            total_ce_oi += c_oi
+            total_pe_oi += p_oi
+            max_oi_chg   = max(max_oi_chg, abs(c_chg_oi), abs(p_chg_oi))
+
+        S["pcr"]      = round(total_pe_oi / max(1, total_ce_oi), 2)
+        S["net_delta"] = int(total_ce_oi * 0.5 - total_pe_oi * 0.5)
+        S["oi_spike"] = max_oi_chg > 50000
+
+        print(f"[CHAIN] spot={spot:.0f} atm={atm} "
+              f"CE=₹{S['atm_ce_ltp']:.1f}(IV:{S['atm_ce_iv']:.0f}%) "
+              f"PE=₹{S['atm_pe_ltp']:.1f}(IV:{S['atm_pe_iv']:.0f}%) "
+              f"PCR={S['pcr']}")
+
+    except Exception as e:
+        log_err(f"CHAIN fetch: {e}")
 
 # ══════════════════════════════════════════════════════════════════
 # PREVIOUS CLOSE — needed for gap detection
@@ -1514,6 +1599,41 @@ class Handler(BaseHTTPRequestHandler):
                 "today_trades": S["today_trades"],
                 "daily_pnl":    S["daily_pnl"],
             })
+        elif path=="/api/chain/test":
+            # ── Debug endpoint — shows raw Dhan option chain response ──
+            # Hit this on first deploy to verify field names are correct
+            # URL: /api/chain/test
+            if not S["token"]:
+                self.send_json({"error":"Not connected — enter token first"})
+                return
+            expiry_date = get_expiry().strftime("%Y-%m-%d")
+            raw = self.run_async(dpost("/v2/optionchain",{
+                "UnderlyingScrip":13,"UnderlyingSeg":"IDX_I",
+                "ExpiryDate":expiry_date
+            }))
+            if raw:
+                data = raw.get("data", raw)
+                oc   = data.get("oc", {})
+                # Show first 2 strikes only — enough to see field names
+                sample_strikes = dict(list(oc.items())[:2]) if oc else {}
+                self.send_json({
+                    "status":          "ok",
+                    "expiry_used":     expiry_date,
+                    "top_level_keys":  list(data.keys())[:10],
+                    "underlying_price":data.get("underlying_price","NOT FOUND"),
+                    "oc_strike_count": len(oc),
+                    "sample_2_strikes":sample_strikes,
+                    "current_state": {
+                        "spot":       S["spot"],
+                        "atm_strike": S["atm_strike"],
+                        "atm_ce_ltp": S["atm_ce_ltp"],
+                        "atm_pe_ltp": S["atm_pe_ltp"],
+                        "atm_ce_iv":  S["atm_ce_iv"],
+                        "pcr":        S["pcr"],
+                    }
+                })
+            else:
+                self.send_json({"error":"Dhan API returned empty","expiry_used":expiry_date})
         elif path=="/api/funds":
             self.send_json(self.run_async(dget("/v2/fundlimit")) or {})
         elif path=="/api/positions":
