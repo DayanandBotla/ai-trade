@@ -72,14 +72,16 @@ S = {
     "setup_score":     0,       # 0-100 quality score based on structure
 
     # VWAP Reclaim tracking (CE — TREND_UP)
-    "vwap_was_below":      False,  # price was below VWAP (pullback happened)
-    "vwap_pullback_low":   0.0,    # lowest point during pullback (sets SL)
-    "vwap_below_candles":  0,      # how many candles below VWAP
+    "vwap_was_below":       False,
+    "vwap_pullback_low":    0.0,
+    "vwap_below_candles":   0,
+    "vwap_below_last_ts":   "",   # timestamp of last counted candle (prevents double-count)
 
     # VWAP Fade tracking (PE — TREND_DOWN)
-    "vwap_was_above":      False,  # price was above VWAP (rally happened)
-    "vwap_rally_high":     0.0,    # highest point during rally (sets SL)
-    "vwap_above_candles":  0,      # how many candles above VWAP
+    "vwap_was_above":       False,
+    "vwap_rally_high":      0.0,
+    "vwap_above_candles":   0,
+    "vwap_above_last_ts":   "",   # timestamp of last counted candle
 
     # EMA Pullback tracking
     "ema_touch_count":     0,      # candles that touched EMA21 zone
@@ -410,19 +412,30 @@ async def fetch_nse():
 # PREVIOUS CLOSE — needed for gap detection
 # ══════════════════════════════════════════════════════════════════
 async def fetch_prev_close():
+    """
+    Fetch yesterday's close for gap detection.
+    BUG FIX: Cannot use today's date for EOD — intraday today has no EOD yet.
+    Solution: Fetch last 7 calendar days, take the second-to-last close returned
+              (last = today's partial if market open, second-to-last = yesterday's close).
+    """
     if not S["token"]: return
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today     = datetime.now().strftime("%Y-%m-%d")
+        from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         r = await dpost("/v2/charts/eod", {
             "securityId":"13","exchangeSegment":"IDX_I",
             "instrument":"INDEX","expiryCode":0,"oi":False,
-            "fromDate":today,"toDate":today
+            "fromDate":from_date,"toDate":today
         })
         if r:
             closes = r.get("close",[])
-            if len(closes)>=2:
+            # Last value may be partial today — use second-to-last (yesterday's close)
+            if len(closes) >= 2:
                 S["prev_close"] = closes[-2]
-                print(f"[PREV] Previous close: {S['prev_close']}")
+                print(f"[PREV] Yesterday close: {S['prev_close']}")
+            elif len(closes) == 1:
+                S["prev_close"] = closes[-1]
+                print(f"[PREV] Close (only 1 bar): {S['prev_close']}")
     except Exception as e:
         log_err(f"prev_close: {e}")
 
@@ -637,11 +650,13 @@ def check_vwap_reclaim():
     cur  = bars5[-2]
     prev = bars5[-3] if len(bars5) >= 3 else None
 
-    # Track pullback state
+    # Track pullback state — only count each CANDLE once (not each 5s scan cycle)
     if cur["c"] < vwap:
-        # Still below VWAP — track pullback
         S["vwap_was_below"] = True
-        S["vwap_below_candles"] = S["vwap_below_candles"] + 1
+        cur_ts = cur.get("t","")
+        if cur_ts != S["vwap_below_last_ts"]:   # new candle — count it
+            S["vwap_below_candles"]  = S["vwap_below_candles"] + 1
+            S["vwap_below_last_ts"]  = cur_ts
         if cur["l"] < S["vwap_pullback_low"] or S["vwap_pullback_low"] == 0:
             S["vwap_pullback_low"] = cur["l"]
         return None
@@ -674,9 +689,10 @@ def check_vwap_reclaim():
                   f"| SL:{sl_pts}pts | Tgt:{tgt_pts}pts")
 
         # Reset tracker
-        S["vwap_was_below"] = False
-        S["vwap_below_candles"] = 0
-        S["vwap_pullback_low"] = 0
+        S["vwap_was_below"]      = False
+        S["vwap_below_candles"]  = 0
+        S["vwap_pullback_low"]   = 0
+        S["vwap_below_last_ts"]  = ""
 
         return {
             "setup":    "VWAP_RECLAIM",
@@ -688,10 +704,10 @@ def check_vwap_reclaim():
             "reason":   reason,
         }
     else:
-        # Price is above VWAP, reset pullback tracker
         if not S["vwap_was_below"]:
             S["vwap_below_candles"] = 0
             S["vwap_pullback_low"]  = 0
+            S["vwap_below_last_ts"] = ""
 
     return None
 
@@ -737,10 +753,13 @@ def check_vwap_fade():
 
     cur = bars5[-2]  # last fully closed candle
 
-    # ── Phase 1: Track rally above VWAP ──────────────────────────
+    # ── Phase 1: Track rally above VWAP — count each CANDLE once only ──
     if cur["c"] > vwap:
-        S["vwap_was_above"]     = True
-        S["vwap_above_candles"] = S["vwap_above_candles"] + 1
+        S["vwap_was_above"] = True
+        cur_ts = cur.get("t","")
+        if cur_ts != S["vwap_above_last_ts"]:   # new candle — count it
+            S["vwap_above_candles"] = S["vwap_above_candles"] + 1
+            S["vwap_above_last_ts"] = cur_ts
         if cur["h"] > S["vwap_rally_high"] or S["vwap_rally_high"] == 0:
             S["vwap_rally_high"] = cur["h"]
         return None
@@ -758,12 +777,13 @@ def check_vwap_fade():
             S["vwap_was_above"]     = False
             S["vwap_above_candles"] = 0
             S["vwap_rally_high"]    = 0.0
+            S["vwap_above_last_ts"] = ""
             return None
 
         spot_close  = cur["c"]
         rally_high  = S["vwap_rally_high"]
-        sl_spot     = rally_high + 5                       # SL above rally high
-        tgt_spot    = vwap - (rally_high - vwap) * 1.5    # symmetric target below VWAP
+        sl_spot     = rally_high + 5
+        tgt_spot    = vwap - (rally_high - vwap) * 1.5
 
         sl_pts  = round(sl_spot  - spot_close)
         tgt_pts = round(spot_close - tgt_spot)
@@ -777,6 +797,7 @@ def check_vwap_fade():
         S["vwap_was_above"]     = False
         S["vwap_above_candles"] = 0
         S["vwap_rally_high"]    = 0.0
+        S["vwap_above_last_ts"] = ""
 
         return {
             "setup":    "VWAP_FADE",
@@ -788,10 +809,11 @@ def check_vwap_fade():
             "reason":   reason,
         }
     else:
-        # Price below VWAP but no prior rally — just tracking, reset if needed
+        # Price below VWAP but no prior rally — reset if needed
         if not S["vwap_was_above"]:
             S["vwap_above_candles"] = 0
             S["vwap_rally_high"]    = 0.0
+            S["vwap_above_last_ts"] = ""
 
     return None
 
@@ -1101,37 +1123,73 @@ def expiry_str():
 # TRAILING STOP
 # ══════════════════════════════════════════════════════════════════
 def update_trail_sl(pos, ltp):
-    method = S["trail_method"]
-    cur_sl = pos["trail_sl"]
+    """
+    Trail SL operates in OPTION PREMIUM space (₹80, ₹120 etc).
+    ltp    = current option premium price
+    entry  = option premium at entry
+    trail_sl = option premium SL level
+
+    BUG FIX: Supertrend value is a NIFTY SPOT level (~22,000).
+    It cannot be directly compared against option premium (~80-150).
+    Convert: spot_sl → premium_sl using ATM delta ≈ 0.50
+    """
+    method  = S["trail_method"]
+    cur_sl  = pos["trail_sl"]
+    entry   = pos["entry"]
+    option  = pos.get("option","CE")  # CE = long delta, PE = long delta (we always buy)
+
     if method == "supertrend":
-        st = S["supertrend_5m"]
-        if st > 0:
-            if pos["side"] == "BUY":  pos["trail_sl"] = max(cur_sl, st-5)
-            else:                     pos["trail_sl"] = min(cur_sl, st+5)
+        st_spot = S["supertrend_5m"]   # SPOT value e.g. 22100
+        spot    = S["spot"]
+        if st_spot > 0 and spot > 0:
+            delta = 0.5
+            # Distance from spot to supertrend in spot pts
+            dist_pts = abs(spot - st_spot)
+            # Convert to premium equivalent: spot_pts × delta
+            prem_sl = round(ltp - dist_pts * delta, 1)
+            prem_sl = max(prem_sl, entry * 0.3)  # never trail below 30% of entry
+            pos["trail_sl"] = max(cur_sl, prem_sl)
+
     elif method == "candle_low":
         bars = CANDLES["5m"]
         if len(bars) >= 2:
-            if pos["side"] == "BUY":  pos["trail_sl"] = max(cur_sl, bars[-2]["l"]-2)
-            else:                     pos["trail_sl"] = min(cur_sl, bars[-2]["h"]+2)
+            delta    = 0.5
+            spot     = S["spot"]
+            candle_l = bars[-2]["l"]  # last closed candle low (SPOT)
+            if spot > 0:
+                dist_pts = max(0, spot - candle_l)
+                prem_sl  = round(ltp - dist_pts * delta, 1)
+                prem_sl  = max(prem_sl, entry * 0.3)
+                pos["trail_sl"] = max(cur_sl, prem_sl)
+
     elif method == "fixed":
-        profit = ltp-pos["entry"] if pos["side"]=="BUY" else pos["entry"]-ltp
+        # Pure premium-based: trail once 20pts in profit
+        profit = ltp - entry
         if profit > 20:
-            if pos["side"] == "BUY":  pos["trail_sl"] = max(cur_sl, pos["entry"]+profit*0.5)
-            else:                     pos["trail_sl"] = min(cur_sl, pos["entry"]-profit*0.5)
+            new_sl = round(entry + profit * 0.5, 1)
+            pos["trail_sl"] = max(cur_sl, new_sl)
+
     return pos
 
 def check_exit(pos, ltp):
-    side = pos["side"]
-    if side == "BUY":
-        if ltp <= pos["trail_sl"]: return True,"TRAIL SL HIT"
-        if ltp >= pos["target"]:   return True,"TARGET HIT ✅"
-    else:
-        if ltp >= pos["trail_sl"]: return True,"TRAIL SL HIT"
-        if ltp <= pos["target"]:   return True,"TARGET HIT ✅"
-    if side=="BUY"  and S["supertrend_dir"]=="DOWN": return True,"SUPERTREND FLIP"
-    if side=="SELL" and S["supertrend_dir"]=="UP":   return True,"SUPERTREND FLIP"
-    now=datetime.now()
-    if now.hour==14 and now.minute>=44: return True,"TIME EXIT 2:44"
+    """
+    All exits operate on OPTION PREMIUM price (ltp).
+    We always BUY options (CE for bullish, PE for bearish bets).
+    So we exit when premium falls to trail_sl or rises to target.
+    pos["option"] tells us CE or PE — determines which supertrend flip = exit.
+    """
+    # Premium SL and target (always long option = premium goes up to win)
+    if ltp <= pos["trail_sl"]:  return True, "TRAIL SL HIT"
+    if ltp >= pos["target"]:    return True, "TARGET HIT ✅"
+
+    # Supertrend structural flip — only exit if market reverses against option direction
+    opt = pos.get("option","CE")
+    if opt == "CE" and S["supertrend_dir"] == "DOWN": return True, "SUPERTREND FLIP ↓"
+    if opt == "PE" and S["supertrend_dir"] == "UP":   return True, "SUPERTREND FLIP ↑"
+
+    # Time exit — always flatten before 2:44 PM
+    now = datetime.now()
+    if now.hour == 14 and now.minute >= 44: return True, "TIME EXIT 2:44"
     return False, ""
 
 # ══════════════════════════════════════════════════════════════════
@@ -1540,8 +1598,10 @@ class Handler(BaseHTTPRequestHandler):
             S["trade_log"]=[]; S["position"]=None
             S["regime"]="UNKNOWN"; S["orb_locked"]=False
             S["orb_high"]=None; S["orb_low"]=None; S["orb_range"]=0
-            S["vwap_was_below"]=False; S["vwap_pullback_low"]=0; S["vwap_below_candles"]=0
-            S["vwap_was_above"]=False; S["vwap_rally_high"]=0.0; S["vwap_above_candles"]=0
+            S["vwap_was_below"]=False; S["vwap_pullback_low"]=0
+            S["vwap_below_candles"]=0; S["vwap_below_last_ts"]=""
+            S["vwap_was_above"]=False; S["vwap_rally_high"]=0.0
+            S["vwap_above_candles"]=0; S["vwap_above_last_ts"]=""
             S["setup_type"]=None
             for f in [SESSION_FILE(),TRADES_FILE()]:
                 try:
