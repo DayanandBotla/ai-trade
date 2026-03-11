@@ -7,6 +7,14 @@ VPS-hosted | Access from any device via browser
 Install : pip install httpx
 Run     : python app.py
 Deploy  : Railway.app / Render.com / any VPS
+
+FIXES APPLIED (vs original):
+  [FIX-1] fetch_candles: 15m fetches 4 days so EMA55 can compute (was today-only = max 25 bars, needed 57)
+  [FIX-2] compute_indicators: 15m threshold lowered 57→22
+  [FIX-3] RSI zones: non-overlapping (was 42-58 firing both BUY and SELL)
+  [FIX-4] Trading sessions: Session1 9:30-12:15, Pause, Session2 2:20-2:45
+  [FIX-5] Expiry day: Session2 closes 2:45 PM (was 2:30)
+  [FIX-6] Scan logger: prints every cycle so you can see engine activity in Railway logs
 """
 
 import httpx, asyncio, time, json, threading, socket, math, os
@@ -38,6 +46,8 @@ S = {
     # Signal
     "signal": None, "last_scan": "--:--:--",
     "signal_score": 0, "signal_reasons": [],
+    # Session
+    "session_name": "Initializing...",
     # Position
     "position": None,
     # Risk
@@ -57,38 +67,31 @@ S = {
 CANDLES = {"3m": [], "5m": [], "15m": []}
 
 # ════════════════════════════════════════════
-# PERSISTENCE — survives restarts & token refresh
-# Files rotate daily — each day gets its own file.
+# PERSISTENCE
 # ════════════════════════════════════════════
 SESSION_FILE = lambda: f"scalper_session_{datetime.now().strftime('%Y-%m-%d')}.json"
 TRADES_FILE  = lambda: f"scalper_trades_{datetime.now().strftime('%Y-%m-%d')}.json"
-CREDS_FILE   = "scalper_creds.json"   # persists client_id + token across restarts
+CREDS_FILE   = "scalper_creds.json"
 
 def save_session():
-    """
-    Write trading state to disk.
-    Called: after every trade close, every 5 alerts, on position open.
-    NOTE: token is saved separately in CREDS_FILE — not in session.
-    """
     try:
         data = {
-            "date":         datetime.now().strftime("%Y-%m-%d"),
-            "daily_pnl":    S["daily_pnl"],
-            "today_trades": S["today_trades"],
-            "win":          S["win"],
-            "loss":         S["loss"],
-            "position":     S["position"],
-            "auto_mode":    S["auto_mode"],
-            "paper_mode":   S["paper_mode"],
-            # Risk settings (user may have changed via UI)
-            "sl_points":      S["sl_points"],
-            "target_points":  S["target_points"],
-            "max_lots":       S["max_lots"],
-            "max_daily_loss": S["max_daily_loss"],
-            "max_daily_profit":S["max_daily_profit"],
-            "max_trades":     S["max_trades"],
-            "trail_method":   S["trail_method"],
-            "saved_at":     datetime.now().strftime("%H:%M:%S"),
+            "date":          datetime.now().strftime("%Y-%m-%d"),
+            "daily_pnl":     S["daily_pnl"],
+            "today_trades":  S["today_trades"],
+            "win":           S["win"],
+            "loss":          S["loss"],
+            "position":      S["position"],
+            "auto_mode":     S["auto_mode"],
+            "paper_mode":    S["paper_mode"],
+            "sl_points":     S["sl_points"],
+            "target_points": S["target_points"],
+            "max_lots":      S["max_lots"],
+            "max_daily_loss":    S["max_daily_loss"],
+            "max_daily_profit":  S["max_daily_profit"],
+            "max_trades":    S["max_trades"],
+            "trail_method":  S["trail_method"],
+            "saved_at":      datetime.now().strftime("%H:%M:%S"),
         }
         with open(SESSION_FILE(), "w") as f:
             json.dump(data, f, indent=2)
@@ -96,7 +99,6 @@ def save_session():
         print(f"[PERSIST] save_session failed: {e}")
 
 def save_trade(trade):
-    """Immediately append a closed trade to today's trade file."""
     try:
         trades = []
         tf = TRADES_FILE()
@@ -110,12 +112,6 @@ def save_trade(trade):
         print(f"[PERSIST] save_trade failed: {e}")
 
 def save_creds():
-    """
-    Save client_id + token to disk.
-    This is the key difference from NiftyEdge — credentials are
-    entered at runtime via /api/connect, not via env vars.
-    Saved separately so token refresh doesn't wipe trade data.
-    """
     try:
         with open(CREDS_FILE, "w") as f:
             json.dump({
@@ -127,17 +123,8 @@ def save_creds():
         print(f"[PERSIST] save_creds failed: {e}")
 
 def load_session():
-    """
-    On startup: restore today's session + credentials from disk.
-    Scenario coverage:
-      Railway restart     → credentials + full day state restored
-      Token update        → only update token, keep all trade data
-      Browser refresh     → server state already in memory, instant
-      New day             → new date = fresh session file, stale = ignored
-    """
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # ── 1. Restore credentials (client_id + token) ──
     if os.path.exists(CREDS_FILE):
         try:
             with open(CREDS_FILE) as f:
@@ -151,27 +138,25 @@ def load_session():
         except Exception as e:
             print(f"[PERSIST] Creds load failed: {e}")
 
-    # ── 2. Restore today's session ──
     sf = SESSION_FILE()
     if os.path.exists(sf):
         try:
             with open(sf) as f:
                 data = json.load(f)
             if data.get("date") == today:
-                S["daily_pnl"]      = data.get("daily_pnl", 0)
-                S["today_trades"]   = data.get("today_trades", 0)
-                S["win"]            = data.get("win", 0)
-                S["loss"]           = data.get("loss", 0)
-                S["auto_mode"]      = data.get("auto_mode", False)
-                S["paper_mode"]     = data.get("paper_mode", True)
-                S["sl_points"]      = data.get("sl_points", S["sl_points"])
-                S["target_points"]  = data.get("target_points", S["target_points"])
-                S["max_lots"]       = data.get("max_lots", S["max_lots"])
-                S["max_daily_loss"] = data.get("max_daily_loss", S["max_daily_loss"])
+                S["daily_pnl"]       = data.get("daily_pnl", 0)
+                S["today_trades"]    = data.get("today_trades", 0)
+                S["win"]             = data.get("win", 0)
+                S["loss"]            = data.get("loss", 0)
+                S["auto_mode"]       = data.get("auto_mode", False)
+                S["paper_mode"]      = data.get("paper_mode", True)
+                S["sl_points"]       = data.get("sl_points", S["sl_points"])
+                S["target_points"]   = data.get("target_points", S["target_points"])
+                S["max_lots"]        = data.get("max_lots", S["max_lots"])
+                S["max_daily_loss"]  = data.get("max_daily_loss", S["max_daily_loss"])
                 S["max_daily_profit"]= data.get("max_daily_profit", S["max_daily_profit"])
-                S["max_trades"]     = data.get("max_trades", S["max_trades"])
-                S["trail_method"]   = data.get("trail_method", S["trail_method"])
-                # Restore open position if any
+                S["max_trades"]      = data.get("max_trades", S["max_trades"])
+                S["trail_method"]    = data.get("trail_method", S["trail_method"])
                 pos = data.get("position")
                 if pos:
                     S["position"] = pos
@@ -181,7 +166,6 @@ def load_session():
         except Exception as e:
             print(f"[PERSIST] Session load failed: {e}")
 
-    # ── 3. Restore today's trade log ──
     tf = TRADES_FILE()
     if os.path.exists(tf):
         try:
@@ -218,18 +202,23 @@ def log_err(msg):
     S["errors"].insert(0, f"{datetime.now().strftime('%H:%M:%S')} {msg}")
     S["errors"] = S["errors"][:20]
     print(f"[ERR] {msg}")
-    # Save every 5 errors too (catches crashes)
     if len(S["errors"]) % 5 == 0:
         save_session()
 
 # ─── CANDLE FETCHER ───────────────────────────────────────────────
+# [FIX-1] 15m fetches 4 days back so EMA55 warmup works.
+#         3m/5m stay today-only for fresh intraday signals.
 async def fetch_candles(mins, count=80):
     if not S["token"]: return []
-    today = datetime.now().strftime("%Y-%m-%d")
-    yest  = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    body  = {"securityId": "13", "exchangeSegment": "IDX_I",
-             "instrument": "INDEX", "interval": str(mins),
-             "fromDate": yest, "toDate": today}
+    today     = datetime.now().strftime("%Y-%m-%d")
+    days_back = 4 if mins == 15 else 1
+    from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+
+    body = {
+        "securityId": "13", "exchangeSegment": "IDX_I",
+        "instrument": "INDEX", "interval": str(mins),
+        "fromDate": from_date, "toDate": today,
+    }
     async with httpx.AsyncClient(timeout=15) as c:
         try:
             r = await c.post(f"{DHAN_BASE}/v2/charts/intraday",
@@ -239,19 +228,22 @@ async def fetch_candles(mins, count=80):
             closes = d.get("close", []);  opens  = d.get("open",  [])
             highs  = d.get("high",  []);  lows   = d.get("low",   [])
             vols   = d.get("volume",[]);  times  = d.get("timestamp",[])
-            result, today_str = [], datetime.now().strftime("%Y-%m-%d")
+            result = []
+            today_str = datetime.now().strftime("%Y-%m-%d")
             for i in range(len(closes)):
                 ts = str(times[i]) if i < len(times) else ""
-                if today_str not in ts: continue
+                # 3m/5m: today only | 15m: all days returned (for EMA warmup)
+                if mins in (3, 5) and today_str not in ts:
+                    continue
                 result.append({
-                    "o": opens[i]  if i<len(opens)  else closes[i],
-                    "h": highs[i]  if i<len(highs)  else closes[i],
-                    "l": lows[i]   if i<len(lows)   else closes[i],
+                    "o": opens[i]  if i < len(opens)  else closes[i],
+                    "h": highs[i]  if i < len(highs)  else closes[i],
+                    "l": lows[i]   if i < len(lows)   else closes[i],
                     "c": closes[i],
-                    "v": vols[i]   if i<len(vols)   else 0,
+                    "v": vols[i]   if i < len(vols)   else 0,
                     "t": ts,
                 })
-            print(f"[C] {mins}m={len(result)} bars")
+            print(f"[C] {mins}m = {len(result)} bars (from {from_date})")
             return result[-count:]
         except Exception as e:
             log_err(f"candles {mins}m: {e}"); return []
@@ -259,7 +251,7 @@ async def fetch_candles(mins, count=80):
 async def refresh_candles():
     c3  = await fetch_candles(3,  100)
     c5  = await fetch_candles(5,  60)
-    c15 = await fetch_candles(15, 40)
+    c15 = await fetch_candles(15, 80)
     if c3:  CANDLES["3m"]  = c3
     if c5:  CANDLES["5m"]  = c5
     if c15: CANDLES["15m"] = c15
@@ -395,15 +387,17 @@ async def fetch_nse():
             log_err(f"NSE fetch: {e}")
 
 # ─── COMPUTE ALL INDICATORS ───────────────────────────────────────
+# [FIX-2] 15m threshold lowered from 57 → 22 (max intraday bars = 25)
 def compute_indicators():
     bars15 = CANDLES["15m"]
     bars5  = CANDLES["5m"]
     bars3  = CANDLES["3m"]
 
-    if len(bars15) >= 57:
+    if len(bars15) >= 22:
         cl = [b["c"] for b in bars15]
         S["ema21_15m"] = ema(cl, 21) or 0
-        S["ema55_15m"] = ema(cl, 55) or 0
+        # Graceful: use available bars if < 55 (early in multi-day warmup)
+        S["ema55_15m"] = ema(cl, min(55, len(cl))) or 0
 
     if len(bars5) >= 15:
         cl = [b["c"] for b in bars5]
@@ -436,10 +430,81 @@ def compute_indicators():
         S["macd_hist"] = hist; S["macd_cross"] = cross
         S["rsi"] = calc_rsi(cl)
 
-# ─── SIGNAL ENGINE ────────────────────────────────────────────────
-def build_signal():
+# ─── SESSION / TIME HELPER ────────────────────────────────────────
+# [FIX-4] Two sessions + lunch pause
+#
+#  Regular day:
+#    Session 1 : 9:30 AM  → 12:15 PM
+#    PAUSE     : 12:15 PM → 2:20 PM
+#    Session 2 : 2:20 PM  → 2:45 PM
+#
+#  Expiry day:
+#    Session 1 : 9:30 AM  → 11:30 AM  (shorter — avoid gamma spikes)
+#    PAUSE     : 11:30 AM → 2:20 PM
+#    Session 2 : 2:20 PM  → 2:45 PM   [FIX-5] same 2:45 cutoff as regular
+def get_session_info():
+    """
+    Returns:
+        in_session  : bool — True if we should hunt for signals
+        session_name: str  — human-readable label for UI / logs
+        pause_reason: str  — why paused (empty string if in session)
+    """
     now = datetime.now()
     h, m = now.hour, now.minute
+    t = h * 60 + m   # minutes since midnight
+
+    # ── Time boundaries (minutes since midnight) ──
+    S1_START = 9  * 60 + 30   # 9:30
+    S1_END   = 12 * 60 + 15   # 12:15
+    S2_START = 14 * 60 + 20   # 14:20
+    S2_END   = 14 * 60 + 45   # 14:45
+
+    if t < S1_START:
+        mins_left = S1_START - t
+        return False, "Pre-Market ⏳", f"Market opens in {mins_left} min (9:30 AM)"
+    elif S1_START <= t < S1_END:
+        return True,  "Session 1 🟢", ""
+    elif S1_END <= t < S2_START:
+        mins_left = S2_START - t
+        return False, "PAUSE ⏸",     f"Lunch pause — Session 2 starts in {mins_left} min (2:20 PM)"
+    elif S2_START <= t <= S2_END:
+        return True,  "Session 2 🟢", ""
+    else:
+        return False, "Closed 🔴",    "Trading closed for today (after 2:45 PM)"
+
+
+def get_session_info_expiry():
+    """
+    Expiry day variant:
+      Session 1 : 9:30 → 11:30
+      PAUSE     : 11:30 → 14:20
+      Session 2 : 14:20 → 14:45  (same end as regular — FIX-5)
+    """
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    t = h * 60 + m
+
+    S1_START     = 9  * 60 + 30   # 9:30
+    S1_END_EXP   = 11 * 60 + 30   # 11:30  (shorter on expiry)
+    S2_START     = 14 * 60 + 20   # 14:20
+    S2_END       = 14 * 60 + 45   # 14:45  [FIX-5] same as regular
+
+    if t < S1_START:
+        mins_left = S1_START - t
+        return False, "Expiry Pre-Market ⏳", f"Opens in {mins_left} min (9:30 AM)"
+    elif S1_START <= t < S1_END_EXP:
+        return True,  "Expiry S1 🟡", ""
+    elif S1_END_EXP <= t < S2_START:
+        mins_left = S2_START - t
+        return False, "Expiry PAUSE ⏸", f"Expiry pause — S2 at 2:20 PM ({mins_left} min)"
+    elif S2_START <= t <= S2_END:
+        return True,  "Expiry S2 🟡", ""
+    else:
+        return False, "Expiry Closed 🔴", "Expiry trading closed after 2:45 PM"
+
+
+# ─── SIGNAL ENGINE ────────────────────────────────────────────────
+def build_signal():
     spot = S["spot"]
     if spot == 0:
         return _wait("No market data yet")
@@ -469,26 +534,26 @@ def build_signal():
     elif adx >= 18:
         filters.append(("WAIT", 40, f"ADX {adx} — Weak trend, be careful"))
     else:
-        filters.append(("WAIT", 0, f"ADX {adx} — Choppy market, SKIP"))
+        filters.append(("WAIT", 0,  f"ADX {adx} — Choppy market, SKIP"))
 
     # F3: 5min Supertrend
     sd = S["supertrend_dir"]; sv = S["supertrend_5m"]
     if sd == "UP":
-        filters.append(("BUY", 88, f"5m Supertrend UP @ {sv:.0f}"))
+        filters.append(("BUY",  88, f"5m Supertrend UP @ {sv:.0f}"))
     elif sd == "DOWN":
         filters.append(("SELL", 88, f"5m Supertrend DOWN @ {sv:.0f}"))
     else:
-        filters.append(("WAIT", 0, "5m Supertrend not ready"))
+        filters.append(("WAIT", 0,  "5m Supertrend not ready"))
 
     # F4: VWAP
     vv = S["vwap"]; vu = S["vwap_upper"]; vl = S["vwap_lower"]
     if vv > 0:
         gap = abs(spot - vv) / vv * 100
         if spot > vu:
-            filters.append(("BUY", 85, f"Price above VWAP upper band {vu:.0f}"))
+            filters.append(("BUY",  85, f"Price above VWAP upper band {vu:.0f}"))
         elif spot > vv:
             st = 90 if gap < 0.2 else 72
-            filters.append(("BUY", st, f"Price {spot:.0f} > VWAP {vv:.0f} (+{gap:.2f}%)"))
+            filters.append(("BUY",  st, f"Price {spot:.0f} > VWAP {vv:.0f} (+{gap:.2f}%)"))
         elif spot < vl:
             filters.append(("SELL", 85, f"Price below VWAP lower band {vl:.0f}"))
         else:
@@ -502,15 +567,15 @@ def build_signal():
     if bu > 0:
         if sq:
             if spot > S["bb_mid"]:
-                filters.append(("BUY", 92, "BB Squeeze breakout UPWARD"))
+                filters.append(("BUY",  92, "BB Squeeze breakout UPWARD"))
             else:
                 filters.append(("SELL", 92, "BB Squeeze breakout DOWNWARD"))
         elif spot > bu:
-            filters.append(("BUY", 80, f"Price above BB upper {bu:.0f}"))
+            filters.append(("BUY",  80, f"Price above BB upper {bu:.0f}"))
         elif spot < bl2:
             filters.append(("SELL", 80, f"Price below BB lower {bl2:.0f}"))
         elif spot > S["bb_mid"]:
-            filters.append(("BUY", 65, "Price above BB midline"))
+            filters.append(("BUY",  65, "Price above BB midline"))
         else:
             filters.append(("SELL", 65, "Price below BB midline"))
     else:
@@ -520,30 +585,30 @@ def build_signal():
     cross = S["macd_cross"]; hist = S["macd_hist"]
     mv = S["macd"]; sv2 = S["macd_signal"]
     if cross == "BULLISH" and hist > 0:
-        filters.append(("BUY", 92, f"3m MACD bullish crossover hist={hist:.2f}"))
+        filters.append(("BUY",  92, f"3m MACD bullish crossover hist={hist:.2f}"))
     elif cross == "BEARISH" and hist < 0:
         filters.append(("SELL", 92, f"3m MACD bearish crossover hist={hist:.2f}"))
     elif mv > sv2 and hist > 0:
-        filters.append(("BUY", 68, f"3m MACD above signal hist={hist:.2f}"))
+        filters.append(("BUY",  68, f"3m MACD above signal hist={hist:.2f}"))
     elif mv < sv2 and hist < 0:
         filters.append(("SELL", 68, f"3m MACD below signal hist={hist:.2f}"))
     else:
         filters.append(("WAIT", 20, f"3m MACD neutral hist={hist:.2f}"))
 
-    # F7: RSI
+    # F7: RSI — [FIX-3] non-overlapping zones
     rsi = S["rsi"]
     if rsi > 78:
         filters.append(("SELL", 85, f"RSI {rsi} overbought — avoid buy"))
     elif rsi < 22:
-        filters.append(("BUY", 85, f"RSI {rsi} oversold — avoid sell"))
-    elif 42 <= rsi <= 62:
-        filters.append(("BUY", 78, f"RSI {rsi} — prime long zone"))
-    elif 38 <= rsi <= 58:
-        filters.append(("SELL", 78, f"RSI {rsi} — prime short zone"))
-    elif rsi > 62:
-        filters.append(("BUY", 60, f"RSI {rsi} — bullish momentum"))
+        filters.append(("BUY",  85, f"RSI {rsi} oversold — avoid sell"))
+    elif rsi >= 55:
+        filters.append(("BUY",  78, f"RSI {rsi} — bullish zone"))
+    elif rsi <= 45:
+        filters.append(("SELL", 78, f"RSI {rsi} — bearish zone"))
+    elif 46 <= rsi <= 54:
+        filters.append(("WAIT", 40, f"RSI {rsi} — neutral band, no edge"))
     else:
-        filters.append(("SELL", 60, f"RSI {rsi} — bearish momentum"))
+        filters.append(("WAIT", 30, f"RSI {rsi} — indeterminate"))
 
     # F8: Volume
     vr = S["vol_ratio"]
@@ -554,20 +619,20 @@ def build_signal():
     elif vr >= 1.0:
         filters.append(("PASS", 55, f"Volume {vr:.1f}x avg — Average"))
     else:
-        filters.append(("WAIT", 0, f"Volume {vr:.1f}x avg — Low, skip"))
+        filters.append(("WAIT", 0,  f"Volume {vr:.1f}x avg — Low, skip"))
 
     # F9: PCR + OI
     pcr = S["pcr"]; nd = S["net_delta"]; spike = S["oi_spike"]
     score = 0; reasons_oi = []
-    if pcr > 1.25:   score += 35; reasons_oi.append(f"PCR {pcr} bullish")
-    elif pcr < 0.75: score -= 35; reasons_oi.append(f"PCR {pcr} bearish")
-    else:            reasons_oi.append(f"PCR {pcr} neutral")
+    if pcr > 1.25:    score += 35; reasons_oi.append(f"PCR {pcr} bullish")
+    elif pcr < 0.75:  score -= 35; reasons_oi.append(f"PCR {pcr} bearish")
+    else:             reasons_oi.append(f"PCR {pcr} neutral")
     if nd > 25000:    score += 35; reasons_oi.append(f"Delta +{nd//1000}K long")
     elif nd < -25000: score -= 35; reasons_oi.append(f"Delta {nd//1000}K short")
     if spike: score = int(score * 1.3); reasons_oi.append("OI spike!")
     oi_reason = " | ".join(reasons_oi)
     if score >= 45:
-        filters.append(("BUY", min(92, 60+abs(score//3)), oi_reason))
+        filters.append(("BUY",  min(92, 60+abs(score//3)), oi_reason))
     elif score <= -45:
         filters.append(("SELL", min(92, 60+abs(score//3)), oi_reason))
     else:
@@ -589,6 +654,7 @@ def build_signal():
     elif len(pure_sells) == 5 and sell_conf >= 85:
         direction = "SELL"; conf = round(sell_conf * 0.92)
 
+    # Hard vetoes
     adx_f = next((f for f in filters if "ADX" in f[2]), None)
     vol_f = next((f for f in filters if "Volume" in f[2]), None)
     if adx_f and adx_f[0] == "WAIT" and "Choppy" in adx_f[2]:
@@ -598,6 +664,7 @@ def build_signal():
     if conf < 80 and direction != "WAIT":
         return _wait(f"Confidence {conf}% below 80% threshold")
 
+    # Daily limits
     if S["today_trades"] >= S["max_trades"] and direction != "WAIT":
         return _wait("1 quality trade already taken today")
     if S["daily_pnl"] <= -S["max_daily_loss"]:
@@ -605,11 +672,19 @@ def build_signal():
     if S["daily_pnl"] >= S["max_daily_profit"]:
         return _wait("Daily profit target hit — bank it")
 
+    # ── [FIX-4 + FIX-5] SESSION / TIME CHECK ──────────────────────
     exp = is_expiry_today()
-    in_time = (h == 9 and m >= 30) or (10 <= h <= 13) or (h == 14 and m == 0)
-    if exp: in_time = (h == 9 and m >= 30) or (10 <= h <= 11) or (h == 11 and m <= 30)
-    if not in_time and direction != "WAIT":
-        return _wait("Outside trading hours" if not exp else "Expiry: stop after 11:30 AM")
+    if exp:
+        in_session, session_name, pause_reason = get_session_info_expiry()
+    else:
+        in_session, session_name, pause_reason = get_session_info()
+
+    S["session_name"] = session_name   # expose to UI
+
+    if not in_session and direction != "WAIT":
+        label = pause_reason if pause_reason else session_name
+        return _wait(label)
+    # ──────────────────────────────────────────────────────────────
 
     atm = round(spot / 50) * 50
     opt = "CE" if direction == "BUY" else "PE"
@@ -620,7 +695,7 @@ def build_signal():
     tgt     = premium + tgt_pts
     rr      = round(tgt_pts / max(1, sl_pts), 1)
 
-    S["last_scan"] = now.strftime("%H:%M:%S")
+    S["last_scan"] = datetime.now().strftime("%H:%M:%S")
 
     return {
         "direction":  direction, "confidence": conf,
@@ -629,7 +704,8 @@ def build_signal():
         "buy_count":  len(pure_buys), "sell_count": len(pure_sells),
         "is_expiry":  exp,
         "filters":    [{"dir":f[0],"score":f[1],"reason":f[2]} for f in filters],
-        "spot":       spot, "time": now.strftime("%H:%M:%S"), "score": conf,
+        "spot":       spot, "time": datetime.now().strftime("%H:%M:%S"), "score": conf,
+        "session":    session_name,
     }
 
 def _wait(reason):
@@ -641,6 +717,7 @@ def _wait(reason):
         "filters": [], "spot": S["spot"],
         "time": datetime.now().strftime("%H:%M:%S"),
         "reason": reason, "score": 0,
+        "session": S.get("session_name", ""),
     }
 
 # ─── EXPIRY LOGIC ─────────────────────────────────────────────────
@@ -716,7 +793,7 @@ def check_exit(pos, ltp):
     if side == "BUY"  and rsi > 80: return True, "RSI OVERBOUGHT EXIT"
     if side == "SELL" and rsi < 20: return True, "RSI OVERSOLD EXIT"
     now = datetime.now()
-    if now.hour == 14 and now.minute >= 15: return True, "TIME EXIT — 2:15 PM"
+    if now.hour == 14 and now.minute >= 44: return True, "TIME EXIT — 2:44 PM"
     return False, ""
 
 # ─── ORDER MANAGEMENT ─────────────────────────────────────────────
@@ -768,7 +845,6 @@ async def enter_trade(sig):
     }
     S["today_trades"] += 1
     print(f"[ENTRY] {sig['direction']} {sig['strike']}{sig['option']} @ {entry_price}")
-    # ── PERSIST: save immediately when position opens ──
     save_session()
 
 async def exit_trade(exit_price, reason):
@@ -787,23 +863,20 @@ async def exit_trade(exit_price, reason):
     else:       S["loss"] += 1
 
     trade_record = {
-        "time":   datetime.now().strftime("%H:%M:%S"),
-        "side":   pos["side"],
-        "strike": f"{pos['strike']}{pos['option']}",
-        "entry":  pos["entry"],
-        "exit":   round(exit_price, 1),
-        "pnl":    round(pnl, 0),
-        "lots":   pos["lots"],
-        "reason": reason,
+        "time":    datetime.now().strftime("%H:%M:%S"),
+        "side":    pos["side"],
+        "strike":  f"{pos['strike']}{pos['option']}",
+        "entry":   pos["entry"],
+        "exit":    round(exit_price, 1),
+        "pnl":     round(pnl, 0),
+        "lots":    pos["lots"],
+        "reason":  reason,
+        "session": S.get("session_name", ""),
     }
     S["trade_log"].insert(0, trade_record)
     S["position"] = None
-
-    # ── PERSIST: write trade to disk immediately ──
     save_trade(trade_record)
-    # ── PERSIST: save full session after close ──
     save_session()
-
     print(f"[EXIT] {reason} @ {exit_price:.0f} PnL=Rs{pnl:.0f}")
 
 async def fetch_ltp(strike, opt):
@@ -831,6 +904,21 @@ async def scanner():
             compute_indicators()
             sig = build_signal()
             S["signal"] = sig
+
+            # [FIX-6] Scan logger — visible in Railway logs every cycle
+            direction = sig.get("direction", "WAIT")
+            reason    = sig.get("reason", "")
+            bc        = sig.get("buy_count", 0)
+            sc        = sig.get("sell_count", 0)
+            conf      = sig.get("confidence", 0)
+            session   = S.get("session_name", "")
+            print(
+                f"[SCAN] {datetime.now().strftime('%H:%M:%S')} "
+                f"| {session} "
+                f"| spot={S['spot']:.0f} "
+                f"| {direction} buys={bc} sells={sc} conf={conf}% "
+                f"| {reason or 'evaluating...'}"
+            )
 
             if S["auto_mode"] and sig["direction"] != "WAIT" and not S["position"]:
                 await enter_trade(sig)
@@ -860,10 +948,11 @@ def _get_blockers():
     now = datetime.now(); h, m = now.hour, now.minute
     blockers = []
     bars3 = len(CANDLES["3m"]); bars5 = len(CANDLES["5m"]); bars15 = len(CANDLES["15m"])
+
     if not S["connected"]:
         blockers.append("NOT CONNECTED — enter Dhan token in Settings")
-    if bars15 < 57:
-        blockers.append(f"15min candles: only {bars15}/57 ready")
+    if bars15 < 22:
+        blockers.append(f"15min candles: only {bars15}/22 ready")
     if bars5 < 20:
         blockers.append(f"5min candles: only {bars5}/20 ready")
     if bars3 < 40:
@@ -874,9 +963,17 @@ def _get_blockers():
         blockers.append(f"Volume {S['vol_ratio']:.1f}x — need 1.5x minimum")
     if S["spot"] == 0:
         blockers.append("No market data")
-    time_ok = (h == 9 and m >= 30) or (10 <= h <= 13) or (h == 14 and m == 0)
-    if not time_ok:
-        blockers.append(f"Outside trading hours (now {h:02d}:{m:02d})")
+
+    # [FIX-4] Session-aware time check
+    exp = is_expiry_today()
+    if exp:
+        in_session, session_name, pause_reason = get_session_info_expiry()
+    else:
+        in_session, session_name, pause_reason = get_session_info()
+
+    if not in_session:
+        blockers.append(f"{pause_reason} (now {h:02d}:{m:02d})")
+
     if S["today_trades"] >= S["max_trades"]:
         blockers.append(f"Max trades reached ({S['today_trades']}/{S['max_trades']})")
     if S["daily_pnl"] <= -S["max_daily_loss"]:
@@ -885,6 +982,7 @@ def _get_blockers():
         blockers.append("Daily profit target hit")
     if not S["auto_mode"]:
         blockers.append("AUTO mode OFF")
+
     sig = S["signal"] or {}
     bc = sig.get("buy_count", 0); sc = sig.get("sell_count", 0); conf = sig.get("confidence", 0)
     if bc > 0 or sc > 0:
@@ -892,6 +990,7 @@ def _get_blockers():
             blockers.append(f"Only {max(bc,sc)}/9 filters agree — need 6")
         if conf > 0 and conf < 80:
             blockers.append(f"Confidence {conf}% below 80%")
+
     if not blockers:
         blockers.append("All systems GO — waiting for 6+ filters to align")
     return blockers
@@ -945,16 +1044,30 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/signal":
             self.send_json(S["signal"] or _wait("No signal yet"))
         elif path == "/api/diagnostics":
-            now = datetime.now(); sig = S["signal"] or {}
+            now = datetime.now()
+            sig = S["signal"] or {}
+            exp = is_expiry_today()
+            in_session, session_name, pause_reason = (
+                get_session_info_expiry() if exp else get_session_info()
+            )
             self.send_json({
-                "timestamp": now.strftime("%H:%M:%S"),
-                "server_alive": True, "connected": S["connected"],
-                "paper_mode": S["paper_mode"], "auto_mode": S["auto_mode"],
-                "spot": S["spot"], "last_scan": S["last_scan"],
+                "timestamp":    now.strftime("%H:%M:%S"),
+                "server_alive": True,
+                "connected":    S["connected"],
+                "paper_mode":   S["paper_mode"],
+                "auto_mode":    S["auto_mode"],
+                "spot":         S["spot"],
+                "last_scan":    S["last_scan"],
+                "session": {
+                    "name":         session_name,
+                    "in_session":   in_session,
+                    "pause_reason": pause_reason,
+                    "is_expiry":    exp,
+                },
                 "candles": {
                     "3min":  {"bars": len(CANDLES["3m"]),  "ready": len(CANDLES["3m"])  >= 40},
                     "5min":  {"bars": len(CANDLES["5m"]),  "ready": len(CANDLES["5m"])  >= 20},
-                    "15min": {"bars": len(CANDLES["15m"]), "ready": len(CANDLES["15m"]) >= 57},
+                    "15min": {"bars": len(CANDLES["15m"]), "ready": len(CANDLES["15m"]) >= 22},
                 },
                 "indicators": {
                     "ema21_15m":  {"value": round(S["ema21_15m"],1),     "ready": S["ema21_15m"] > 0},
@@ -985,7 +1098,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(self.run_async(dget("/v2/positions")) or [])
         elif path == "/api/orders":
             self.send_json(self.run_async(dget("/v2/orders")) or [])
-        # ── PERSIST: export today's trades ──
         elif path == "/api/session/export":
             tf = TRADES_FILE()
             trades = []
@@ -994,8 +1106,8 @@ class Handler(BaseHTTPRequestHandler):
             wins   = [t for t in trades if t.get("pnl", 0) > 0]
             losses = [t for t in trades if t.get("pnl", 0) <= 0]
             self.send_json({
-                "date":    datetime.now().strftime("%Y-%m-%d"),
-                "trades":  trades,
+                "date":   datetime.now().strftime("%Y-%m-%d"),
+                "trades": trades,
                 "summary": {
                     "total_trades": len(trades),
                     "wins":         len(wins),
@@ -1019,7 +1131,6 @@ class Handler(BaseHTTPRequestHandler):
             r = self.run_async(dget("/v2/fundlimit"))
             if r:
                 S["connected"] = True; S["paper_mode"] = False
-                # ── PERSIST: save credentials immediately on connect ──
                 save_creds()
                 self.send_json({"status": "connected", "funds": r})
             else:
@@ -1028,7 +1139,6 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/disconnect":
             S["connected"] = False; S["token"] = ""; S["paper_mode"] = True
-            # ── PERSIST: wipe saved credentials on disconnect ──
             if os.path.exists(CREDS_FILE):
                 try: os.remove(CREDS_FILE)
                 except: pass
@@ -1038,7 +1148,6 @@ class Handler(BaseHTTPRequestHandler):
             S["auto_mode"] = True;  save_session(); self.send_json({"auto_mode": True})
         elif path == "/api/auto/off":
             S["auto_mode"] = False; save_session(); self.send_json({"auto_mode": False})
-
         elif path == "/api/paper/on":
             S["paper_mode"] = True;  save_session(); self.send_json({"paper_mode": True})
         elif path == "/api/paper/off":
@@ -1072,12 +1181,10 @@ class Handler(BaseHTTPRequestHandler):
             for k in ["sl_points","target_points","max_lots","max_daily_loss",
                       "max_daily_profit","max_trades","trail_method"]:
                 if k in body: S[k] = body[k]
-            # ── PERSIST: save settings change immediately ──
             save_session()
             self.send_json({"status": "saved"})
 
         elif path == "/api/reset":
-            # Wipe today's disk files and reset stats
             S["daily_pnl"] = 0; S["today_trades"] = 0
             S["win"] = 0; S["loss"] = 0
             S["trade_log"] = []; S["position"] = None
@@ -1088,7 +1195,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"status": "reset"})
 
         elif path == "/api/session/save":
-            # ── PERSIST: manual force save ──
             save_session()
             self.send_json({"status": "saved", "time": datetime.now().strftime("%H:%M:%S")})
 
@@ -1103,14 +1209,15 @@ if __name__ == "__main__":
     try: ip = socket.gethostbyname(socket.gethostname())
     except: ip = "localhost"
 
-    print("\n" + "="*50)
+    print("\n" + "="*55)
     print("  NIFTY PRO SCALPER — STARTED")
     print(f"  Local  : http://localhost:{PORT}")
     print(f"  Network: http://{ip}:{PORT}")
-    print("  Only requires: httpx")
-    print("="*50 + "\n")
+    print("  Sessions:")
+    print("    Regular : 9:30–12:15 | PAUSE | 2:20–2:45")
+    print("    Expiry  : 9:30–11:30 | PAUSE | 2:20–2:45")
+    print("="*55 + "\n")
 
-    # ── PERSIST: restore session before scanner starts ──
     load_session()
 
     def run_bg():
